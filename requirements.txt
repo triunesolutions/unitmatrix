@@ -1,0 +1,6 @@
+streamlit==1.45.1
+pymupdf>=1.24
+pytesseract>=0.3.13
+Pillow>=10.0
+openpyxl>=3.1
+pandas>=2.0
