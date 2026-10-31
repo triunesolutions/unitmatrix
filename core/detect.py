@@ -16,8 +16,10 @@ from PIL import Image
 # The whole line must be the label ("UNIT TYPE 2C", "UNIT A1.0", "Unit 2-0") so notes such as
 # "REFER TO UNIT TYPE 2A PLANS" are not counted.
 # The code must contain a digit, so headers such as "UNIT HEATER" / "UNIT TOTALS" are skipped.
+# A trailing variant ("Unit 4-0 Type A") stays part of the name, as in the reference "A1 TYPE A".
 UNIT_LABEL_RE = re.compile(
-    r"^UNIT\s+(TYPE\s+)?([A-Z]*\d[A-Z0-9.\-]*)(?:\s*-\s*\d\s*(?:BD|BED|BR|BEDROOM)S?)?$", re.I)
+    r"^UNIT\s+(TYPE\s+)?([A-Z]*\d[A-Z0-9.\-]*)(\s+TYPE\s+[A-Z0-9]+)?"
+    r"(?:\s*-\s*\d\s*(?:BD|BED|BR|BEDROOM)S?)?$", re.I)
 LABEL_PREFILTER_RE = re.compile(r"^\s*UNIT\s+(?:TYPE\s+)?[A-Z]*\d", re.I | re.M)
 INLINE_BED_RE =re.compile(r"-\s*(\d)\s*(?:BD|BED|BR|BEDROOM)S?\b", re.I)
 BED_LINE_RE = re.compile(r"^(\d)\s*(?:BD|BED|BR|BEDROOM)S?$", re.I)
@@ -27,6 +29,9 @@ UNIT_NO_RE = re.compile(r"^\d{3,5}[A-Z]?$")
 # How far (PDF points) around a UNIT TYPE line to look for the rest of its label stack.
 STACK_DX = 90
 STACK_DY = 75
+# Some sheets draw every label twice, slightly offset (overlaid text layers). Same-name labels
+# closer than this are one unit; real neighbouring units measured >= 121pt apart.
+DUPLICATE_DISTANCE = 100
 
 
 def _lines(page: fitz.Page) -> list[dict[str, Any]]:
@@ -120,6 +125,8 @@ def detect_unit_types(page: fitz.Page, page_number: int) -> list[dict[str, Any]]
         if not match:
             continue
         unit_type = match.group(2).upper().strip(".-")
+        if match.group(3):
+            unit_type += " " + re.sub(r"\s+", " ", match.group(3).strip().upper())
         bed = None
         inline = INLINE_BED_RE.search(line["text"])
         if inline:
@@ -139,7 +146,7 @@ def detect_unit_types(page: fitz.Page, page_number: int) -> list[dict[str, Any]]
             page_number, f"{unit_type}-{bed}" if bed else unit_type, line,
             unit_no=min(nos)[1] if nos else "",
         ))
-    return tags
+    return _dedupe(tags)
 
 
 def _token_key(value: str) -> str:
@@ -179,7 +186,18 @@ def detect_names(page: fitz.Page, page_number: int, names: list[str]) -> list[di
             if len(tokens) == len(name_tokens) and _contains(tokens, name_tokens):
                 tags.append(_tag(page_number, name, line))
                 break
-    return tags
+    return _dedupe(tags)
+
+
+def _dedupe(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for tag in tags:
+        cx, cy = tag["x"] + tag["w"] / 2, tag["y"] + tag["h"] / 2
+        if not any(k["unit"] == tag["unit"]
+                   and math.hypot(k["x"] + k["w"] / 2 - cx, k["y"] + k["h"] / 2 - cy) < DUPLICATE_DISTANCE
+                   for k in kept):
+            kept.append(tag)
+    return kept
 
 
 def _tag(page_number: int, name: str, line: dict[str, Any], unit_no: str = "") -> dict[str, Any]:
