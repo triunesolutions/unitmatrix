@@ -146,7 +146,7 @@ def detect_unit_types(page: fitz.Page, page_number: int) -> list[dict[str, Any]]
             page_number, f"{unit_type}-{bed}" if bed else unit_type, line,
             unit_no=min(nos)[1] if nos else "",
         ))
-    return _dedupe(tags)
+    return _with_floor(page, _dedupe(tags))
 
 
 def _token_key(value: str) -> str:
@@ -186,7 +186,7 @@ def detect_names(page: fitz.Page, page_number: int, names: list[str]) -> list[di
             if len(tokens) == len(name_tokens) and _contains(tokens, name_tokens):
                 tags.append(_tag(page_number, name, line))
                 break
-    return _dedupe(tags)
+    return _with_floor(page, _dedupe(tags))
 
 
 def _dedupe(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -224,6 +224,46 @@ def suggest_plan_pages(doc: fitz.Document) -> dict[int, int]:
         if n:
             pages[i] = n
     return pages
+
+
+# "GROUND FLOOR", "2ND LEVEL" / "LEVEL 4B" (sheet B of level 4), "FLOOR 3".
+NAMED_FLOOR_RE = re.compile(
+    r"\b(GROUND|BASEMENT|PODIUM|MEZZANINE|FIRST|SECOND|THIRD|FOURTH|FIFTH|SIXTH|SEVENTH|EIGHTH|NINTH|TENTH"
+    r"|\d{1,2}(?:ST|ND|RD|TH))\s+(FLOOR|LEVEL)\b", re.I)
+NUMBERED_FLOOR_RE = re.compile(r"\b(LEVEL|FLOOR)\s*[-:#]?\s*(\d{1,2})[A-Z]?\b", re.I)
+
+
+def detect_floor_level(page: fitz.Page) -> str:
+    """Floor named by the sheet title: the largest text on the page that names a level.
+
+    Going by size keeps notes and cross-references ("SEE LEVEL 16") from being read as the floor.
+    """
+    best = (0.0, False, "")
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            text = " ".join(s["text"] for s in spans).strip()
+            if not spans or len(text) > 80:
+                continue
+            named = NAMED_FLOOR_RE.search(text)
+            numbered = None if named else NUMBERED_FLOOR_RE.search(text)
+            if not named and not numbered:
+                continue
+            floor = (f"{named.group(1)} {named.group(2)}" if named
+                     else f"{numbered.group(1)} {numbered.group(2)}").upper()
+            # On a size tie a line that says PLAN is the title ("LEVEL 4 WATER HEATER ROOM" is not).
+            key = (max(s["size"] for s in spans), "PLAN" in text.upper(), floor)
+            if key[:2] > best[:2]:
+                best = key
+    return best[2]
+
+
+def _with_floor(page: fitz.Page, tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if tags:
+        floor = detect_floor_level(page)
+        for tag in tags:
+            tag["floor_level"] = floor
+    return tags
 
 
 TITLE_RE = re.compile(r"PLAN|LEVEL|FLOOR|SCHEDULE|MATRIX|MIX|ROOF", re.I)

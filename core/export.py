@@ -20,8 +20,13 @@ def summarise(tags: list[dict[str, Any]]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda kv: kv[0])
 
 
+def _floor(tag: dict[str, Any]) -> str:
+    return str(tag.get("floor_level") or "").strip() or "Not identified"
+
+
 def build_xlsx(tags: list[dict[str, Any]]) -> bytes:
-    """UNIT_MATRIX (final table) / TO (pivot) / DATA (one row per tag), as in UNIT_MATRIX.xlsx."""
+    """UNIT_MATRIX (final table) / TO (pivot) / DATA (one row per tag), as in UNIT_MATRIX.xlsx,
+    plus UNIT FLOOR COUNT (unit x floor)."""
     summary = summarise(tags)
     bold = Font(bold=True)
     wb = Workbook()
@@ -52,7 +57,23 @@ def build_xlsx(tags: list[dict[str, Any]]) -> bytes:
     for cell in data[1]:
         cell.font = bold
 
-    for sheet in (ws, to, data):
+    floors = wb.create_sheet("UNIT FLOOR COUNT")
+    floors.append(["UNIT", "Total", "FLOOR / LEVEL"])
+    named = [t for t in tags if str(t.get("unit", "")).strip()]
+    # Floors follow sheet order, so GROUND comes before SECOND and LEVEL 2 before LEVEL 10.
+    first_page: dict[str, int] = {}
+    for tag in named:
+        floor = _floor(tag)
+        first_page[floor] = min(first_page.get(floor, tag["page"]), tag["page"])
+    counts = Counter((str(t["unit"]).strip(), _floor(t)) for t in named)
+    for (unit, floor), qty in sorted(counts.items(), key=lambda kv: (kv[0][0], first_page[kv[0][1]])):
+        floors.append([unit, qty, floor])
+    floors.append(["Grand Total", f"=SUM(B2:B{len(counts) + 1})"])
+    for cell in (*floors[1], *floors[floors.max_row]):
+        cell.font = bold
+    floors.column_dimensions["C"].width = 22
+
+    for sheet in (ws, to, data, floors):
         sheet.column_dimensions["A"].width = 24
         sheet.column_dimensions["B"].width = 12
 

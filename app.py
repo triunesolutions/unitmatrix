@@ -14,7 +14,7 @@ from core.export import build_pdf, build_xlsx, summarise
 st.set_page_config(page_title="Unit Matrix", page_icon="🏢", layout="wide")
 
 PREVIEW_ZOOM = 0.6
-COLUMNS = ["page", "unit", "unit_no", "matched_text", "x", "y", "w", "h", "source"]
+COLUMNS = ["page", "unit", "floor_level", "unit_no", "matched_text", "x", "y", "w", "h", "source"]
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -52,7 +52,7 @@ def clean(df: pd.DataFrame) -> list[dict]:
     df = df.copy()
     df["unit"] = df["unit"].fillna("").astype(str).str.strip()
     df = df[(df["unit"] != "") & df["page"].notna()]
-    df = df.fillna({"x": 40.0, "y": 40.0, "w": 10.0, "h": 10.0, "unit_no": "", "matched_text": "", "source": "manual"})
+    df = df.fillna({"x": 40.0, "y": 40.0, "w": 10.0, "h": 10.0, "floor_level": "", "unit_no": "", "matched_text": "", "source": "manual"})
     df["page"] = df["page"].astype(int)
     return df.to_dict("records")
 
@@ -105,15 +105,13 @@ def page_label(pn: int) -> str:
     if titles.get(pn):
         bits.append(titles[pn])
     if pn in suggested:
-        bits.append(f"{suggested[pn]} unit labels")
+        bits.append(f"{suggested[pn]} unit labels found")
     return " · ".join(bits)
 
 
-if suggested:
-    st.caption(f"Pre-selected {len(suggested)} pages with unit labels. Remove unit-plan, enlarged-plan or "
-               "schedule sheets so each unit is counted once.")
-pages = st.multiselect("Pages to scan", range(1, page_count + 1),
-                       default=list(suggested) if mode == "auto" else [], format_func=page_label)
+st.caption("Tick the floor-plan sheets to count. Leave out unit-plan, enlarged-plan, RCP and schedule sheets "
+           "so each unit is counted once.")
+pages = st.multiselect("Pages to scan", range(1, page_count + 1), default=[], format_func=page_label)
 
 if st.button("Detect units", type="primary", disabled=not pages or (mode == "names" and not names)):
     st.session_state.tags = pd.DataFrame(
@@ -129,10 +127,11 @@ left, right = st.columns([2, 3])
 with left:
     edited = st.data_editor(
         st.session_state.tags, key=f"editor_{file_hash}", num_rows="dynamic", use_container_width=True,
-        height=520, column_order=["page", "unit", "unit_no", "matched_text"],
+        height=520, column_order=["page", "unit", "floor_level", "unit_no", "matched_text"],
         column_config={
             "page": st.column_config.NumberColumn("Page", min_value=1, max_value=page_count, step=1, required=True),
             "unit": st.column_config.TextColumn("Unit", required=True),
+            "floor_level": st.column_config.TextColumn("Floor / Level"),
             "unit_no": st.column_config.TextColumn("Unit no.", disabled=True),
             "matched_text": st.column_config.TextColumn("Text on plan", disabled=True),
         },
@@ -148,12 +147,19 @@ with right:
 st.subheader("3. Unit matrix")
 summary = summarise(tags)
 matrix = pd.DataFrame(summary + [("Grand Total", sum(q for _, q in summary))], columns=["UNIT", "Total"])
-c1, c2 = st.columns([1, 2])
+by_floor = {}
+for t in sorted(tags, key=lambda t: t["page"]):
+    floor = str(t.get("floor_level") or "").strip() or "Not identified"
+    by_floor[floor] = by_floor.get(floor, 0) + 1
+c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
     st.dataframe(matrix, hide_index=True, use_container_width=True)
 with c2:
+    st.dataframe(pd.DataFrame(list(by_floor.items()), columns=["FLOOR / LEVEL", "Total"]),
+                 hide_index=True, use_container_width=True)
+with c3:
     stem = Path(uploaded.name).stem
-    st.download_button("Download Excel (UNIT_MATRIX / TO / DATA)", build_xlsx(tags),
+    st.download_button("Download Excel", build_xlsx(tags),
                        file_name=f"{stem}_UNIT_MATRIX.xlsx", type="primary",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if st.button("Build tagged PDF"):
