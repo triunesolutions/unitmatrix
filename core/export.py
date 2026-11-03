@@ -24,7 +24,7 @@ def _floor(tag: dict[str, Any]) -> str:
     return str(tag.get("floor_level") or "").strip() or "Not identified"
 
 
-def build_xlsx(tags: list[dict[str, Any]]) -> bytes:
+def build_xlsx(tags: list[dict[str, Any]], comparison: dict[str, Any] | None = None) -> bytes:
     """UNIT_MATRIX (final table) / TO (pivot) / DATA (one row per tag), as in UNIT_MATRIX.xlsx,
     plus UNIT FLOOR COUNT (unit x floor)."""
     summary = summarise(tags)
@@ -73,6 +73,9 @@ def build_xlsx(tags: list[dict[str, Any]]) -> bytes:
         cell.font = bold
     floors.column_dimensions["C"].width = 22
 
+    if comparison:
+        _comparison_sheets(wb, comparison, bold)
+
     for sheet in (ws, to, data, floors):
         sheet.column_dimensions["A"].width = 24
         sheet.column_dimensions["B"].width = 12
@@ -80,6 +83,30 @@ def build_xlsx(tags: list[dict[str, Any]]) -> bytes:
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _comparison_sheets(wb, comparison: dict[str, Any], bold) -> None:
+    """Our count against the architect's table: by unit type, and by unit x level."""
+    for title, rows, columns in (
+        ("COMPARISON", comparison.get("by_unit", []),
+         ["UNIT", "ARCHITECT", "COUNTED", "VARIANCE", "CHECK"]),
+        ("COMPARISON BY LEVEL", comparison.get("by_level", []),
+         ["UNIT", "LEVEL", "ARCHITECT", "COUNTED", "VARIANCE", "CHECK"]),
+    ):
+        if not rows:
+            continue
+        sheet = wb.create_sheet(title)
+        sheet.append(columns)
+        for row in rows:
+            sheet.append([row.get(c, "") for c in columns])
+        sheet.append(["TOTAL"] + [""] * (len(columns) - 5)
+                     + [comparison.get("architect_total", 0), comparison.get("counted_total", 0),
+                        comparison.get("counted_total", 0) - comparison.get("architect_total", 0), ""])
+        for cell in (*sheet[1], *sheet[sheet.max_row]):
+            cell.font = bold
+        for column, width in zip("ABCDEF", (24, 14, 14, 14, 12, 12)):
+            sheet.column_dimensions[column].width = width
+        sheet.freeze_panes = "A2"
 
 
 def build_pdf(pdf_bytes: bytes, tags: list[dict[str, Any]]) -> bytes:

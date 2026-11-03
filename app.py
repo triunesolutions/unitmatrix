@@ -10,6 +10,8 @@ from PIL import Image, ImageDraw
 
 from core.detect import detect_names, detect_unit_types, page_title, suggest_plan_pages
 from core.export import build_pdf, build_xlsx, summarise
+from core.schedule import compare, find_schedules
+from core.sheets import sheet_index
 
 st.set_page_config(page_title="Unit Matrix", page_icon="🏢", layout="wide")
 
@@ -38,6 +40,18 @@ def detect(pdf: bytes, file_hash: str, pages: list[int], mode: str, names: tuple
         progress.progress(n / len(pages), text=f"Scanned page {pn} ({n} of {len(pages)})")
     progress.empty()
     return tags
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def sheet_info(file_hash: str, _pdf: bytes) -> dict[int, dict]:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return sheet_index(doc)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def schedules_on(file_hash: str, _pdf: bytes, pn: int) -> list[dict]:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return find_schedules(doc[pn - 1])
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -79,10 +93,12 @@ if not uploaded:
 pdf = uploaded.getvalue()
 file_hash = hashlib.md5(pdf).hexdigest()
 if st.session_state.get("file_hash") != file_hash:
-    st.session_state.update(file_hash=file_hash, tags=None, page_picker=[], detection_message=None)
+    st.session_state.update(file_hash=file_hash, tags=None, page_picker=[], detection_message=None,
+                            schedule=None, tagged_pdf=None)
 
 with st.spinner("Reading the PDF and looking for floor-plan unit labels…"):
     page_count, suggested, titles = scan(file_hash, pdf)
+    sheets = sheet_info(file_hash, pdf)
 
 # 1. Pages and detection mode
 st.subheader("1. Choose floor-plan pages")
@@ -102,6 +118,8 @@ if mode == "names":
 
 def page_label(pn: int) -> str:
     bits = [f"Page {pn}"]
+    if sheets.get(pn, {}).get("sheet"):
+        bits.append(sheets[pn]["sheet"])
     if titles.get(pn):
         bits.append(titles[pn])
     if pn in suggested:
@@ -109,14 +127,22 @@ def page_label(pn: int) -> str:
     return " · ".join(bits)
 
 
+mechanical = [p for p in range(1, page_count + 1) if sheets.get(p, {}).get("mechanical")]
+only_mech = st.checkbox(
+    f"Show mechanical sheets only ({len(mechanical)} of {page_count}: "
+    f"{', '.join(sorted({sheets[p]['discipline'] for p in mechanical})) or 'none found'})",
+    value=bool(mechanical),
+    help="Mechanical and HVAC sheet numbers (M…, H…) read from each title block.",
+)
 st.caption(
     "Choose only the sheets that contain the floor plans you want to count. "
-    "Leave out unit-plan, enlarged-plan, RCP and schedule sheets so each unit is counted once."
+    "Leave out overall plans where enlarged plans cover the same units, plus roof, "
+    "single-unit, RCP and schedule sheets, so each unit is counted once."
 )
 
 # Keep the widget's own state separate from the detection results. Updating the
 # same key both manually and through a widget can cause selections to be lost.
-all_pages = list(range(1, page_count + 1))
+all_pages = mechanical if (only_mech and mechanical) else list(range(1, page_count + 1))
 if "page_picker" not in st.session_state:
     st.session_state.page_picker = []
 # Remove page numbers left over if a different PDF has fewer pages.
@@ -124,13 +150,13 @@ st.session_state.page_picker = [p for p in st.session_state.page_picker if p in 
 
 select_col, clear_col, count_col = st.columns([1, 1, 2])
 with select_col:
-    if st.button("Select All Pages", use_container_width=True):
+    if st.button("Select all listed", use_container_width=True):
         st.session_state.page_picker = all_pages.copy()
 with clear_col:
     if st.button("Clear Selection", use_container_width=True):
         st.session_state.page_picker = []
 with count_col:
-    st.caption(f"**{len(st.session_state.page_picker)} of {page_count} pages selected**")
+    st.caption(f"**{len(st.session_state.page_picker)} of {len(all_pages)} listed pages selected**")
 
 pages = st.multiselect(
     "Choose pages to scan",
@@ -189,23 +215,83 @@ with right:
     st.image(preview(page_image(file_hash, pdf, shown), [t for t in tags if t["page"] == shown]),
              use_container_width=True)
 
-# 3. Unit matrix + export
-st.subheader("3. Unit matrix")
+# 3. Architect's table
+st.subheader("3. The architect's count table")
+st.caption("Pick the sheet holding the architect's unit table (often the cover or a general sheet). "
+           "Correct anything it misreads, or type the table in yourself.")
+sched_col, pick_col = st.columns([1, 2])
+with sched_col:
+    sched_page = st.selectbox("Sheet with the table", range(1, page_count + 1),
+                              format_func=page_label, key=f"sched_page_{file_hash}")
+found = schedules_on(file_hash, pdf, sched_page)
+with pick_col:
+    if found:
+        choice = st.radio(
+            "Table on this sheet", range(len(found)), horizontal=True,
+            format_func=lambda i: f"{found[i]['title']} — {found[i]['total']} units, {len(found[i]['rows'])} rows",
+            key=f"sched_choice_{file_hash}_{sched_page}")
+    else:
+        choice = None
+        st.info("No unit table recognised on this sheet. Choose another sheet, or type the rows in below.")
+
+parsed = found[choice]["rows"] if found and choice is not None else []
+schedule_df = st.data_editor(
+    pd.DataFrame(parsed or [{"unit": "", "level": "", "qty": 0}]),
+    key=f"sched_editor_{file_hash}_{sched_page}_{choice}", num_rows="dynamic",
+    use_container_width=True, height=240,
+    column_config={
+        "unit": st.column_config.TextColumn("Unit", required=True),
+        "level": st.column_config.TextColumn("Level", help="Leave blank if the table gives no levels"),
+        "qty": st.column_config.NumberColumn("Architect qty", min_value=0, step=1),
+    },
+)
+schedule_rows = [
+    {"unit": str(r["unit"]).strip(), "level": str(r.get("level") or "").strip(), "qty": int(r["qty"] or 0)}
+    for r in schedule_df.to_dict("records")
+    if str(r.get("unit") or "").strip() and int(r.get("qty") or 0) > 0
+]
+
+# 4. Comparison + export
+st.subheader("4. Comparison and export")
 summary = summarise(tags)
-matrix = pd.DataFrame(summary + [("Grand Total", sum(q for _, q in summary))], columns=["UNIT", "Total"])
-by_floor = {}
+result = compare(schedule_rows, tags) if schedule_rows else None
+
+if result:
+    gap = result["counted_total"] - result["architect_total"]
+    headline = (f"Architect {result['architect_total']} · counted {result['counted_total']} · "
+                f"variance {gap:+d}")
+    mismatched = [r for r in result["by_unit"] if r["CHECK"] != "OK"]
+    if gap == 0 and not mismatched:
+        st.success(headline + " — every unit type matches.")
+    else:
+        st.warning(headline + f" — {len(mismatched)} unit type(s) differ.")
+    left_tab, right_tab = st.tabs(["By unit type", "By unit and level"])
+    with left_tab:
+        st.dataframe(pd.DataFrame(result["by_unit"]), hide_index=True, use_container_width=True)
+    with right_tab:
+        if result["by_level"]:
+            st.dataframe(pd.DataFrame(result["by_level"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("The architect's table gives no levels, so there is nothing to compare per level.")
+else:
+    st.caption("Fill in the architect's table above to see the comparison.")
+
+by_floor: dict[str, int] = {}
 for t in sorted(tags, key=lambda t: t["page"]):
     floor = str(t.get("floor_level") or "").strip() or "Not identified"
     by_floor[floor] = by_floor.get(floor, 0) + 1
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    st.dataframe(matrix, hide_index=True, use_container_width=True)
+    st.caption("Our count by unit type")
+    st.dataframe(pd.DataFrame(summary + [("Grand Total", sum(q for _, q in summary))],
+                              columns=["UNIT", "Total"]), hide_index=True, use_container_width=True)
 with c2:
+    st.caption("Our count by floor")
     st.dataframe(pd.DataFrame(list(by_floor.items()), columns=["FLOOR / LEVEL", "Total"]),
                  hide_index=True, use_container_width=True)
 with c3:
     stem = Path(uploaded.name).stem
-    st.download_button("Download Excel", build_xlsx(tags),
+    st.download_button("Download Excel", build_xlsx(tags, result),
                        file_name=f"{stem}_UNIT_MATRIX.xlsx", type="primary",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if st.button("Build tagged PDF"):
@@ -214,5 +300,5 @@ with c3:
     if st.session_state.get("tagged_pdf"):
         st.download_button("Download tagged PDF", st.session_state.tagged_pdf,
                            file_name=f"{stem}_tagged.pdf", mime="application/pdf")
-    st.caption("PDF tags are Polygon markups with subject FLOOR UNIT and contents “<unit>⏎1”, the same as a "
-               "manual Bluebeam count, so Bluebeam's markup summary gives the same totals.")
+    st.caption("PDF tags are Polygon markups with subject FLOOR UNIT and contents “<unit>⏎1”, the same "
+               "as a manual Bluebeam count, so Bluebeam's markup summary gives the same totals.")
