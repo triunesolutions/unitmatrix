@@ -79,7 +79,7 @@ if not uploaded:
 pdf = uploaded.getvalue()
 file_hash = hashlib.md5(pdf).hexdigest()
 if st.session_state.get("file_hash") != file_hash:
-    st.session_state.update(file_hash=file_hash, tags=None)
+    st.session_state.update(file_hash=file_hash, tags=None, page_picker=[], detection_message=None)
 
 with st.spinner("Reading the PDF and looking for floor-plan unit labels…"):
     page_count, suggested, titles = scan(file_hash, pdf)
@@ -109,13 +109,59 @@ def page_label(pn: int) -> str:
     return " · ".join(bits)
 
 
-st.caption("Tick the floor-plan sheets to count. Leave out unit-plan, enlarged-plan, RCP and schedule sheets "
-           "so each unit is counted once.")
-pages = st.multiselect("Pages to scan", range(1, page_count + 1), default=[], format_func=page_label)
+st.caption(
+    "Choose only the sheets that contain the floor plans you want to count. "
+    "Leave out unit-plan, enlarged-plan, RCP and schedule sheets so each unit is counted once."
+)
+
+# Keep the widget's own state separate from the detection results. Updating the
+# same key both manually and through a widget can cause selections to be lost.
+all_pages = list(range(1, page_count + 1))
+if "page_picker" not in st.session_state:
+    st.session_state.page_picker = []
+# Remove page numbers left over if a different PDF has fewer pages.
+st.session_state.page_picker = [p for p in st.session_state.page_picker if p in all_pages]
+
+select_col, clear_col, count_col = st.columns([1, 1, 2])
+with select_col:
+    if st.button("Select All Pages", use_container_width=True):
+        st.session_state.page_picker = all_pages.copy()
+with clear_col:
+    if st.button("Clear Selection", use_container_width=True):
+        st.session_state.page_picker = []
+with count_col:
+    st.caption(f"**{len(st.session_state.page_picker)} of {page_count} pages selected**")
+
+pages = st.multiselect(
+    "Choose pages to scan",
+    options=all_pages,
+    key="page_picker",
+    format_func=page_label,
+    placeholder="Select one or more pages…",
+)
+
+if pages:
+    st.caption("Selected pages: " + ", ".join(str(p) for p in sorted(pages)))
 
 if st.button("Detect units", type="primary", disabled=not pages or (mode == "names" and not names)):
-    st.session_state.tags = pd.DataFrame(
-        detect(pdf, file_hash, sorted(pages), mode, tuple(names)), columns=COLUMNS)
+    detected = detect(pdf, file_hash, sorted(pages), mode, tuple(names))
+    if detected:
+        st.session_state.tags = pd.DataFrame(detected, columns=COLUMNS)
+        st.session_state.detection_message = f"Detected {len(detected)} unit labels across {len(pages)} selected page(s)."
+    else:
+        # Do not let an empty detection run replace valid prior results or create a blank workbook.
+        st.session_state.tags = None
+        st.session_state.detection_message = (
+            f"No units were detected on selected pages: {', '.join(map(str, sorted(pages)))}. "
+            "Check that these are floor-plan pages and that the selected detection mode matches "
+            "the labels on the drawings. Try 'Match my list of unit names' if needed."
+        )
+
+if st.session_state.get("detection_message"):
+    if st.session_state.get("tags") is None:
+        st.warning(st.session_state.detection_message)
+    else:
+        st.success(st.session_state.detection_message)
 
 if st.session_state.get("tags") is None:
     st.stop()
