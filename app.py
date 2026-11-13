@@ -16,6 +16,8 @@ from core.sheets import sheet_index
 st.set_page_config(page_title="Unit Matrix", page_icon="🏢", layout="wide")
 
 PREVIEW_ZOOM = 0.6
+THUMB_ZOOM = 0.16
+THUMB_COLUMNS = 5
 COLUMNS = ["page", "unit", "floor_level", "unit_no", "matched_text", "x", "y", "w", "h", "source"]
 
 
@@ -52,6 +54,14 @@ def sheet_info(file_hash: str, _pdf: bytes) -> dict[int, dict]:
 def schedules_on(file_hash: str, _pdf: bytes, pn: int) -> list[dict]:
     with fitz.open(stream=_pdf, filetype="pdf") as doc:
         return find_schedules(doc[pn - 1])
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def thumbnail(file_hash: str, _pdf: bytes, pn: int) -> Image.Image:
+    """Small render of one page for the visual picker."""
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(THUMB_ZOOM, THUMB_ZOOM), alpha=False)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -93,7 +103,7 @@ if not uploaded:
 pdf = uploaded.getvalue()
 file_hash = hashlib.md5(pdf).hexdigest()
 if st.session_state.get("file_hash") != file_hash:
-    st.session_state.update(file_hash=file_hash, tags=None, page_picker=[], detection_message=None,
+    st.session_state.update(file_hash=file_hash, tags=None, detection_message=None,
                             schedule=None, tagged_pdf=None)
 
 with st.spinner("Reading the PDF and looking for floor-plan unit labels…"):
@@ -140,34 +150,54 @@ st.caption(
     "single-unit, RCP and schedule sheets, so each unit is counted once."
 )
 
-# Keep the widget's own state separate from the detection results. Updating the
-# same key both manually and through a widget can cause selections to be lost.
 all_pages = mechanical if (only_mech and mechanical) else list(range(1, page_count + 1))
-if "page_picker" not in st.session_state:
-    st.session_state.page_picker = []
-# Remove page numbers left over if a different PDF has fewer pages.
-st.session_state.page_picker = [p for p in st.session_state.page_picker if p in all_pages]
 
-select_col, clear_col, count_col = st.columns([1, 1, 2])
+
+def pick_key(pn: int) -> str:
+    return f"pick_{file_hash}_{pn}"
+
+
+# The tick boxes are the single source of truth. The buttons below are rendered before
+# them, so setting their state here happens before the widgets exist on this run.
+select_col, clear_col, thumbs_col, count_col = st.columns([1, 1, 1.2, 1.6])
 with select_col:
-    if st.button("Select all listed", use_container_width=True):
-        st.session_state.page_picker = all_pages.copy()
+    select_all = st.button("Select all listed", use_container_width=True)
 with clear_col:
-    if st.button("Clear Selection", use_container_width=True):
-        st.session_state.page_picker = []
+    clear_all = st.button("Clear selection", use_container_width=True)
+with thumbs_col:
+    show_thumbs = st.toggle("Show page images", value=True)
+for pn in all_pages:
+    if select_all:
+        st.session_state[pick_key(pn)] = True
+    elif clear_all:
+        st.session_state[pick_key(pn)] = False
 with count_col:
-    st.caption(f"**{len(st.session_state.page_picker)} of {len(all_pages)} listed pages selected**")
+    chosen = sum(1 for pn in all_pages if st.session_state.get(pick_key(pn)))
+    st.caption(f"**{chosen} of {len(all_pages)} listed pages selected**")
 
-pages = st.multiselect(
-    "Choose pages to scan",
-    options=all_pages,
-    key="page_picker",
-    format_func=page_label,
-    placeholder="Select one or more pages…",
-)
+if show_thumbs:
+    with st.spinner("Rendering page images…"):
+        for row_start in range(0, len(all_pages), THUMB_COLUMNS):
+            row = all_pages[row_start:row_start + THUMB_COLUMNS]
+            for column, pn in zip(st.columns(THUMB_COLUMNS), row):
+                with column:
+                    st.image(thumbnail(file_hash, pdf, pn), use_container_width=True)
+                    found = suggested.get(pn)
+                    st.checkbox(
+                        f"**{pn}** · {sheets.get(pn, {}).get('sheet') or '—'}"
+                        + (f" · {found} labels" if found else ""),
+                        key=pick_key(pn),
+                        help=page_label(pn),
+                    )
+else:
+    for row_start in range(0, len(all_pages), 2):
+        for column, pn in zip(st.columns(2), all_pages[row_start:row_start + 2]):
+            with column:
+                st.checkbox(page_label(pn), key=pick_key(pn))
 
+pages = [pn for pn in all_pages if st.session_state.get(pick_key(pn))]
 if pages:
-    st.caption("Selected pages: " + ", ".join(str(p) for p in sorted(pages)))
+    st.caption("Selected pages: " + ", ".join(str(p) for p in pages))
 
 if st.button("Detect units", type="primary", disabled=not pages or (mode == "names" and not names)):
     detected = detect(pdf, file_hash, sorted(pages), mode, tuple(names))
