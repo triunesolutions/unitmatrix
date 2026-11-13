@@ -161,14 +161,26 @@ def _tokens(text: str) -> list[str]:
     return [k for t in re.findall(r"[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*", text) if (k := _token_key(t))]
 
 
-def _contains(line_tokens: list[str], name_tokens: list[str]) -> bool:
+def _similar(expected: str, actual: str) -> bool:
+    """Tolerate an OCR misread of one character, but never a different label.
+
+    OCR confuses characters (0/O, 1/I/l) and so preserves length; it does not invent or
+    drop one. Allowing a length change made "MA1.1" match "MA1.1A", which silently merged
+    a label with its own suffixed variant.
+    """
+    if expected == actual:
+        return True
+    return (len(expected) == len(actual) >= 4
+            and SequenceMatcher(None, expected, actual).ratio() >= 0.82)
+
+
+def _contains(line_tokens: list[str], name_tokens: list[str], exact: bool = False) -> bool:
     n = len(name_tokens)
     for i in range(len(line_tokens) - n + 1):
         sample = line_tokens[i:i + n]
         if sample == name_tokens:
             return True
-        if all(e == a or (min(len(e), len(a)) >= 4 and SequenceMatcher(None, e, a).ratio() >= 0.82)
-               for e, a in zip(name_tokens, sample)):
+        if not exact and all(_similar(e, a) for e, a in zip(name_tokens, sample)):
             return True
     return False
 
@@ -179,13 +191,19 @@ def detect_names(page: fitz.Page, page_number: int, names: list[str]) -> list[di
     Matching the whole line (not a substring) keeps 'A2' from also tagging 'A2 END'.
     """
     wanted = [(n.strip(), _tokens(n)) for n in names if len(_token_key(n)) >= 2]
+    # Longest name first, and every exact match before any OCR-tolerant one, so a label
+    # never loses its line to a shorter name it merely resembles.
+    wanted.sort(key=lambda w: (-sum(len(t) for t in w[1]), -len(w[1])))
     tags = []
     for line in _lines(page):
         tokens = _tokens(line["text"])
-        for name, name_tokens in sorted(wanted, key=lambda w: -len(w[1])):
-            if len(tokens) == len(name_tokens) and _contains(tokens, name_tokens):
-                tags.append(_tag(page_number, name, line))
-                break
+        hit = next((n for n, nt in wanted
+                    if len(tokens) == len(nt) and _contains(tokens, nt, exact=True)), None)
+        if hit is None:
+            hit = next((n for n, nt in wanted
+                        if len(tokens) == len(nt) and _contains(tokens, nt)), None)
+        if hit is not None:
+            tags.append(_tag(page_number, hit, line))
     return _with_floor(page, _dedupe(tags))
 
 
