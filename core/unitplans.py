@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os.path
 import re
 from typing import Any
 
@@ -52,28 +53,54 @@ def _owner(tag: dict[str, Any], titles: list[dict[str, Any]]) -> dict[str, Any] 
     return max(left, key=lambda t: t["x"]) if left else min(row, key=lambda t: abs(t["x"] - tag["x"]))
 
 
-def unit_plan_map(doc: fitz.Document, pages: list[int], labels: list[str]) -> dict[str, dict[str, Any]]:
-    """{label: {plan, extra, page}} read off the unit-plan sheets.
+def _base(code: str) -> str:
+    """The unit a code belongs to, without its variant letter: MA2.1B -> MA2.1."""
+    return re.sub(r"[A-Z]+$", "", str(code or "").upper())
 
-    Only lines that are exactly a known floor-plan label count as room tags, so dimensions
-    and equipment tags on the same sheet cannot be mistaken for one.
+
+def unit_plan_map(doc: fitz.Document, pages: list[int], labels: list[str]) -> dict[str, dict[str, Any]]:
+    """{label: {plan, extra, page, source}} read off the unit-plan sheets.
+
+    Only one label per drawing carries a room tag, so tags alone leave the rest of a
+    group unassigned. Labels without a tag fall back to the unit plan drawn for the same
+    base unit (MA2.1 and MA2.1A join the plan titled MA2.1B), which is what makes the
+    merge groups form. `source` says which of the two gave the answer.
     """
     wanted = {str(l).strip().upper() for l in labels if str(l).strip()}
-    found: dict[str, dict[str, Any]] = {}
+    titles_by_page: dict[int, list[dict[str, Any]]] = {}
     for number in pages:
-        if not 1 <= number <= len(doc):
-            continue
-        page = doc[number - 1]
-        titles = _titles(page)
-        if not titles:
-            continue
-        for line in _lines(page):
+        if 1 <= number <= len(doc):
+            found_titles = _titles(doc[number - 1])
+            if found_titles:
+                titles_by_page[number] = found_titles
+
+    found: dict[str, dict[str, Any]] = {}
+    for number, titles in titles_by_page.items():
+        for line in _lines(doc[number - 1]):
             text = line["text"].strip().upper()
             if text not in wanted or TITLE_RE.match(text):
                 continue
             owner = _owner({"x": line["bbox"].x0, "y": line["bbox"].y0}, titles)
             if owner:
-                found.setdefault(text, {"plan": owner["plan"], "extra": owner["extra"], "page": number})
+                found.setdefault(text, {"plan": owner["plan"], "extra": owner["extra"],
+                                        "page": number, "source": "room tag"})
+
+    every_title = [t for titles in titles_by_page.values() for t in titles]
+    for label in sorted(wanted - set(found)):
+        same_unit = [t for t in every_title if _base(t["plan"]) == _base(label)]
+        if not same_unit:
+            continue
+        exact = [t for t in same_unit if t["plan"] == label]
+        if exact:
+            best = exact[0]
+        else:
+            # A variant label (MI2.2B) belongs with another variant plan (MI2.2A) rather than
+            # with the base plan, which its own unsuffixed label already uses.
+            variants = [t for t in same_unit if re.search(r"[A-Z]+$", t["plan"])]
+            pool = variants if (re.search(r"[A-Z]+$", label) and variants) else same_unit
+            best = max(pool, key=lambda t: (len(os.path.commonprefix([t["plan"], label])), -len(t["plan"])))
+        found[label] = {"plan": best["plan"], "extra": best["extra"],
+                        "page": "", "source": "same unit"}
     return found
 
 
