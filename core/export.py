@@ -24,7 +24,8 @@ def _floor(tag: dict[str, Any]) -> str:
     return str(tag.get("floor_level") or "").strip() or "Not identified"
 
 
-def build_xlsx(tags: list[dict[str, Any]], comparison: dict[str, Any] | None = None) -> bytes:
+def build_xlsx(tags: list[dict[str, Any]], comparison: dict[str, Any] | None = None,
+               unit_plans: dict[str, str] | None = None) -> bytes:
     """UNIT_MATRIX (final table) / TO (pivot) / DATA (one row per tag), as in UNIT_MATRIX.xlsx,
     plus UNIT FLOOR COUNT (unit x floor)."""
     summary = summarise(tags)
@@ -73,6 +74,9 @@ def build_xlsx(tags: list[dict[str, Any]], comparison: dict[str, Any] | None = N
         cell.font = bold
     floors.column_dimensions["C"].width = 22
 
+    if unit_plans is not None:
+        _unit_plan_sheet(wb, summary, unit_plans, bold)
+
     if comparison:
         _comparison_sheets(wb, comparison, bold)
 
@@ -83,6 +87,27 @@ def build_xlsx(tags: list[dict[str, Any]], comparison: dict[str, Any] | None = N
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _unit_plan_sheet(wb, summary: list[tuple[str, int]], mapping: dict[str, str], bold) -> None:
+    """Label / UNIT PLAN / Total / MERG QTY, in the merged layout of the manual takeoffs."""
+    from .unitplans import merged_rows
+    rows = merged_rows(summary, mapping)
+    if not rows:
+        return
+    sheet = wb.create_sheet("UNIT PLAN MATRIX")
+    columns = ["Label", "UNIT PLAN", "Total", "MERG QTY"]
+    sheet.append(columns)
+    for row in rows:
+        sheet.append([row[c] for c in columns])
+    sheet.append(["GRAND TOTAL OF UNITS", "",
+                  sum(r["Total"] for r in rows),
+                  sum(r["MERG QTY"] for r in rows if r["MERG QTY"] != "")])
+    for cell in (*sheet[1], *sheet[sheet.max_row]):
+        cell.font = bold
+    for column, width in zip("ABCD", (22, 14, 10, 12)):
+        sheet.column_dimensions[column].width = width
+    sheet.freeze_panes = "A2"
 
 
 def _comparison_sheets(wb, comparison: dict[str, Any], bold) -> None:

@@ -12,6 +12,7 @@ from core.detect import detect_names, detect_unit_types, page_title, suggest_pla
 from core.export import build_pdf, build_xlsx, summarise
 from core.schedule import compare, find_schedules
 from core.sheets import sheet_index
+from core.unitplans import merged_rows, suggest_unit_plan_pages, unit_plan_map
 
 st.set_page_config(page_title="Unit Matrix", page_icon="🏢", layout="wide")
 
@@ -48,6 +49,19 @@ def detect(pdf: bytes, file_hash: str, pages: list[int], mode: str, names: tuple
 def sheet_info(file_hash: str, _pdf: bytes) -> dict[int, dict]:
     with fitz.open(stream=_pdf, filetype="pdf") as doc:
         return sheet_index(doc)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def unit_plan_sheets(file_hash: str, _pdf: bytes) -> dict[int, int]:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return suggest_unit_plan_pages(doc)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def unit_plans_from(file_hash: str, _pdf: bytes, pages: tuple[int, ...],
+                    labels: tuple[str, ...]) -> dict[str, dict]:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return unit_plan_map(doc, list(pages), list(labels))
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -245,9 +259,45 @@ with right:
     st.image(preview(page_image(file_hash, pdf, shown), [t for t in tags if t["page"] == shown]),
              use_container_width=True)
 
-# 3. Architect's table
-st.subheader("3. The architect's count table")
-st.caption("Pick the sheet holding the architect's unit table (often the cover or a general sheet). "
+# 3. Unit plans -> merged pivot
+st.subheader("3. Unit plans (merged pivot)")
+st.caption("Each unit plan sheet draws one enlarged plan per unit type: its title sits underneath "
+           "(“UNIT MI1.2A”) and the greyed room tag inside it names the floor-plan label it was drawn "
+           "from. Pairing the two says which label bills against which unit plan. A label with no unit plan "
+           "drawn for it bills against itself.")
+summary = summarise(tags)
+plan_pages = st.multiselect(
+    "Unit plan sheets", range(1, page_count + 1),
+    default=[p for p in unit_plan_sheets(file_hash, pdf)], format_func=page_label,
+    help="Sheets whose drawings are titled UNIT <code>. Pre-selected from the title blocks.")
+
+derived = unit_plans_from(file_hash, pdf, tuple(sorted(plan_pages)),
+                          tuple(u for u, _ in summary)) if plan_pages else {}
+st.caption(f"Read {len(derived)} label→unit-plan pairs off {len(plan_pages)} sheet(s). "
+           "Correct any row below; blank means the label bills against itself.")
+
+map_df = st.data_editor(
+    pd.DataFrame([{"Label": u, "UNIT PLAN": derived.get(u, {}).get("plan", ""),
+                   "from sheet": derived.get(u, {}).get("page", "")} for u, _ in summary]),
+    key=f"plan_map_{file_hash}_{tuple(sorted(plan_pages))}", use_container_width=True, height=300,
+    column_config={
+        "Label": st.column_config.TextColumn("Label", disabled=True),
+        "UNIT PLAN": st.column_config.TextColumn("UNIT PLAN"),
+        "from sheet": st.column_config.NumberColumn("from sheet", disabled=True),
+    },
+)
+plan_map = {str(r["Label"]): str(r["UNIT PLAN"] or "").strip()
+            for r in map_df.to_dict("records") if str(r.get("Label") or "").strip()}
+pivot_rows = merged_rows(summary, plan_map)
+st.dataframe(pd.DataFrame(pivot_rows + [{"Label": "GRAND TOTAL OF UNITS", "UNIT PLAN": "",
+                                         "Total": sum(r["Total"] for r in pivot_rows),
+                                         "MERG QTY": sum(r["MERG QTY"] for r in pivot_rows
+                                                         if r["MERG QTY"] != "")}]),
+             hide_index=True, use_container_width=True)
+
+# 4. Benchmark table
+st.subheader("4. The benchmark count table")
+st.caption("Pick the sheet holding the benchmark unit table, if the set has one (often a cover or general sheet; mechanical-only sets usually have none). "
            "Correct anything it misreads, or type the table in yourself.")
 sched_col, pick_col = st.columns([1, 2])
 with sched_col:
@@ -282,8 +332,7 @@ schedule_rows = [
 ]
 
 # 4. Comparison + export
-st.subheader("4. Comparison and export")
-summary = summarise(tags)
+st.subheader("5. Comparison and export")
 result = compare(schedule_rows, tags) if schedule_rows else None
 
 if result:
@@ -321,7 +370,7 @@ with c2:
                  hide_index=True, use_container_width=True)
 with c3:
     stem = Path(uploaded.name).stem
-    st.download_button("Download Excel", build_xlsx(tags, result),
+    st.download_button("Download Excel", build_xlsx(tags, result, plan_map),
                        file_name=f"{stem}_UNIT_MATRIX.xlsx", type="primary",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if st.button("Build tagged PDF"):
