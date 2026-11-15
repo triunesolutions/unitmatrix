@@ -15,7 +15,8 @@ from core.detect import (detect_names, detect_unit_tags, detect_unit_types, page
 from core.export import build_pdf, build_xlsx, summarise
 from core.schedule import compare, find_schedules
 from core.sheets import sheet_index
-from core.unitplans import merged_rows, suggest_unit_plan_pages, unit_plan_map
+from core.unitplans import (merged_rows, resolve, suggest_unit_plan_pages, unit_plan_map,
+                            unit_plan_titles)
 
 st.set_page_config(page_title="Unit Matrix", page_icon="🏢", layout="wide")
 
@@ -47,10 +48,17 @@ def unit_plan_sheets(file_hash: str, _pdf: bytes) -> dict[int, int]:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def unit_plans_from(file_hash: str, _pdf: bytes, pages: tuple[int, ...],
-                    labels: tuple[str, ...]) -> dict[str, dict]:
+def unit_plans_from(file_hash: str, _pdf: bytes, pages: tuple[int, ...]) -> tuple[dict, list]:
+    """Label->plan pairs and the plans drawn, read before the floor plans are counted."""
     with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return unit_plan_map(doc, list(pages), list(labels))
+        return unit_plan_map(doc, list(pages), []), unit_plan_titles(doc, list(pages))
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def unit_counts(file_hash: str, _pdf: bytes, pages: tuple[int, ...]) -> dict[int, int]:
+    """How many dwelling room tags each sheet carries — the real count, not a guess."""
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return {pn: len(detect_unit_tags(doc[pn - 1], pn, [])) for pn in pages}
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -300,8 +308,24 @@ if bench_names:
 elif source != "Skip — no benchmark table":
     st.caption("No rows yet — the comparison in step 5 needs them, but you can count without.")
 
-# ---------------------------------------------------------------- 2. floor plan pages
-st.subheader("2. Floor plan pages")
+# ---------------------------------------------------------------- 2. unit plan sheets
+st.subheader("2. Unit plan sheets")
+st.caption("The enlarged plans, one per unit type. The title sits underneath (“UNIT MI1.2A”) and the "
+           "greyed room tag inside names the floor-plan label it was drawn from, which is what says "
+           "which label bills against which unit plan. These sheets are only read for that mapping — "
+           "nothing on them is counted.")
+plan_suggested = unit_plan_sheets(file_hash, pdf)
+plan_pages = page_grid("uplan", ALL,
+                       note=lambda pn: f" · {plan_suggested[pn]} plans" if pn in plan_suggested else "")
+tag_map, plan_titles = unit_plans_from(file_hash, pdf, tuple(sorted(plan_pages))) if plan_pages else ({}, [])
+if plan_pages:
+    st.success(f"{len(plan_titles)} unit plans drawn on {len(plan_pages)} sheet(s); "
+               f"{len(tag_map)} of them name a label in their room tag.")
+else:
+    st.caption("None selected — every label will bill against itself.")
+
+# ---------------------------------------------------------------- 3. floor plan pages
+st.subheader("3. Floor plan pages")
 mode_label = st.radio("How are units labelled on the plans?",
                       ["Auto: unit labels on the plans (UNIT TYPE 2C + 3BD, UNIT A1.0, …)",
                        "Match my list of unit names"], horizontal=True)
@@ -323,13 +347,26 @@ only_mech = st.checkbox(
     f"Show mechanical sheets only ({len(mechanical)} of {page_count}: "
     f"{', '.join(sorted({sheets[p]['discipline'] for p in mechanical})) or 'none found'})",
     value=bool(mechanical), help="Mechanical and HVAC sheet numbers (M…, H…) from each title block.")
-st.caption("Tick only the floor plans to count. Where overall and enlarged plans cover the same units "
-           "take one family, and leave out roof, single-unit, RCP and schedule sheets.")
+st.caption("Tick only the floor plans to count. Each sheet shows how many dwelling room tags it "
+           "actually holds. Where two sheet families cover the same units — ductwork and condensate, "
+           "or overall and enlarged — take one family only, or every unit counts twice.")
 
-floor_pages = page_grid("floor", mechanical if (only_mech and mechanical) else ALL,
-                        note=lambda pn: f" · {suggested[pn]} labels" if pn in suggested else "")
+listed = mechanical if (only_mech and mechanical) else ALL
+with st.spinner("Counting room tags on each sheet…"):
+    per_page = unit_counts(file_hash, pdf, tuple(listed))
+floor_pages = page_grid("floor", listed,
+                        note=lambda pn: f" · **{per_page[pn]} units**" if per_page.get(pn) else "")
 if floor_pages:
-    st.caption("Selected: " + ", ".join(str(p) for p in floor_pages))
+    st.caption("Selected: " + ", ".join(f"{p} ({per_page.get(p, 0)})" for p in floor_pages)
+               + f" — {sum(per_page.get(p, 0) for p in floor_pages)} units in total")
+    # Two sheet families covering the same units give the same per-sheet counts twice over.
+    series = {}
+    for p in floor_pages:
+        series.setdefault(sheets.get(p, {}).get("series") or "?", []).append(per_page.get(p, 0))
+    busy = {s: v for s, v in series.items() if sum(v)}
+    if len(busy) > 1:
+        st.warning("Selected sheets span " + ", ".join(f"{s} ({sum(v)} units)" for s, v in busy.items())
+                   + ". If these families draw the same units, the count will be doubled.")
 
 if st.button("Count units", type="primary",
              disabled=not floor_pages or (mode == "names" and not names)):
@@ -351,8 +388,8 @@ if st.session_state.get("detection_message"):
 if st.session_state.get("tags") is None:
     st.stop()
 
-# ---------------------------------------------------------------- 3. review
-st.subheader("3. Review units")
+# ---------------------------------------------------------------- 4. review
+st.subheader("4. Review units")
 st.caption("Name any blank unit, fix names, delete false hits (select rows → delete), or add missed "
            "units at the bottom. Orange boxes on the preview are units with no type code printed.")
 left, right = st.columns([2, 3])
@@ -380,21 +417,13 @@ if blank:
     st.warning(f"{blank} unit(s) still have no name. They count towards the total but cannot be "
                "matched to the benchmark or to a unit plan until you name them.")
 
-# ---------------------------------------------------------------- 4. unit plans
-st.subheader("4. Unit plan sheets (merged pivot)")
-st.caption("A unit plan sheet draws one enlarged plan per unit type: the title sits underneath "
-           "(“UNIT MI1.2A”) and the greyed room tag inside names the floor-plan label it was drawn "
-           "from. Pairing the two says which label bills against which unit plan. A label the sheets do "
-           "not name takes the plan drawn for the same base unit; one with none bills against itself.")
+# ---------------------------------------------------------------- 5. merged pivot
+st.subheader("5. Merged pivot")
+st.caption("Each counted label against the unit plan it bills to, from the sheets picked in step 2. "
+           "A label the room tags do not name takes the plan drawn for the same base unit; one with "
+           "none bills against itself. Correct any row.")
 summary = summarise(named)
-plan_suggested = unit_plan_sheets(file_hash, pdf)
-plan_pages = page_grid("uplan", ALL, note=lambda pn: f" · {plan_suggested[pn]} plans"
-                       if pn in plan_suggested else "")
-
-derived = unit_plans_from(file_hash, pdf, tuple(sorted(plan_pages)),
-                          tuple(u for u, _ in summary)) if plan_pages else {}
-st.caption(f"Read {len(derived)} label→unit-plan pairs off {len(plan_pages)} sheet(s). "
-           "Correct any row; blank means the label bills against itself.")
+derived = resolve([u for u, _ in summary], tag_map, plan_titles)
 
 map_df = st.data_editor(
     pd.DataFrame([{"Label": u, "UNIT PLAN": derived.get(u, {}).get("plan", ""),
@@ -417,8 +446,8 @@ st.dataframe(pd.DataFrame(pivot_rows + [{"Label": "GRAND TOTAL OF UNITS", "UNIT 
                                                          if r["MERG QTY"] != "")}]),
              hide_index=True, use_container_width=True)
 
-# ---------------------------------------------------------------- 5. comparison + export
-st.subheader("5. Comparison and export")
+# ---------------------------------------------------------------- 6. comparison + export
+st.subheader("6. Comparison and export")
 result = compare(bench_rows, named) if bench_rows else None
 
 if result:

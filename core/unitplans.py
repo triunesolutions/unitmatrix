@@ -14,6 +14,9 @@ from .detect import _lines
 # Pairing the tag with the drawing it sits in says which floor-plan label uses which plan.
 # The code must contain a digit, so "UNIT PLANS" and "UNIT HEATER" are not read as one.
 TITLE_RE = re.compile(r"^UNIT\s+([A-Z]{0,4}\d[A-Z0-9.\-]*)\s*(.*)$", re.I)
+# A room tag inside a drawing, when no label list has been supplied yet: letters then a
+# digit, so the drawing's own title and its unit number are not mistaken for one.
+ROOM_TAG_RE = re.compile(r"^[A-Z]{1,4}\d[A-Z0-9.]*$", re.I)
 TITLE_ROW_TOLERANCE = 25.0
 # A drawing's title starts at or just left of anything inside it.
 TITLE_LEFT_SLACK = 60.0
@@ -58,6 +61,43 @@ def _base(code: str) -> str:
     return re.sub(r"[A-Z]+$", "", str(code or "").upper())
 
 
+def unit_plan_titles(doc: fitz.Document, pages: list[int]) -> list[dict[str, Any]]:
+    """Every unit plan drawn on the given sheets."""
+    found = []
+    for number in pages:
+        if 1 <= number <= len(doc):
+            found.extend(_titles(doc[number - 1]))
+    return found
+
+
+def resolve(labels: list[str], tagged: dict[str, dict[str, Any]],
+            titles: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Fill in the labels the room tags did not name, using the plan for the same base unit.
+
+    Only one label per drawing carries a room tag, so without this the rest of a group maps
+    to itself and the merge never happens.
+    """
+    resolved = {k: v for k, v in tagged.items() if k in set(labels)}
+    for label in labels:
+        if label in resolved:
+            continue
+        same_unit = [t for t in titles if _base(t["plan"]) == _base(label)]
+        if not same_unit:
+            continue
+        exact = [t for t in same_unit if t["plan"] == label]
+        if exact:
+            best = exact[0]
+        else:
+            # A variant label (MI2.2B) belongs with another variant plan (MI2.2A) rather than
+            # with the base plan, which its own unsuffixed label already uses.
+            variants = [t for t in same_unit if re.search(r"[A-Z]+$", t["plan"])]
+            pool = variants if (re.search(r"[A-Z]+$", label) and variants) else same_unit
+            best = max(pool, key=lambda t: (len(os.path.commonprefix([t["plan"], label])), -len(t["plan"])))
+        resolved[label] = {"plan": best["plan"], "extra": best["extra"],
+                           "page": "", "source": "same unit"}
+    return resolved
+
+
 def unit_plan_map(doc: fitz.Document, pages: list[int], labels: list[str]) -> dict[str, dict[str, Any]]:
     """{label: {plan, extra, page, source}} read off the unit-plan sheets.
 
@@ -66,6 +106,8 @@ def unit_plan_map(doc: fitz.Document, pages: list[int], labels: list[str]) -> di
     base unit (MA2.1 and MA2.1A join the plan titled MA2.1B), which is what makes the
     merge groups form. `source` says which of the two gave the answer.
     """
+    # With no label list, anything shaped like a type code counts as a room tag, so the
+    # sheets can be read before the floor plans have been counted.
     wanted = {str(l).strip().upper() for l in labels if str(l).strip()}
     titles_by_page: dict[int, list[dict[str, Any]]] = {}
     for number in pages:
@@ -78,7 +120,8 @@ def unit_plan_map(doc: fitz.Document, pages: list[int], labels: list[str]) -> di
     for number, titles in titles_by_page.items():
         for line in _lines(doc[number - 1]):
             text = line["text"].strip().upper()
-            if text not in wanted or TITLE_RE.match(text):
+            known = text in wanted if wanted else bool(ROOM_TAG_RE.match(text))
+            if not known or TITLE_RE.match(text):
                 continue
             owner = _owner({"x": line["bbox"].x0, "y": line["bbox"].y0}, titles)
             if owner:
