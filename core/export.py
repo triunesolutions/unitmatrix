@@ -6,7 +6,7 @@ from typing import Any
 
 import pymupdf as fitz
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 
 # Bluebeam count markup, same shape as the manual takeoff (Polygon, subject FLOOR UNIT,
 # contents "<unit>\r1"), so Bluebeam's markup summary counts the exported tags too.
@@ -105,6 +105,20 @@ def _unit_plan_sheet(wb, summary: list[tuple[str, int]], mapping: dict[str, str]
                   sum(r["MERG QTY"] for r in rows if r["MERG QTY"] != "")])
     for cell in (*sheet[1], *sheet[sheet.max_row]):
         cell.font = bold
+
+    # Merge the unit plan and its merged quantity down the group, as the manual takeoffs
+    # do: a group starts at a row that carries a MERG QTY and runs to the next one.
+    starts = [i for i, row in enumerate(rows) if row["MERG QTY"] != ""]
+    for position, start in enumerate(starts):
+        end = starts[position + 1] - 1 if position + 1 < len(starts) else len(rows) - 1
+        if end > start:
+            for column in ("B", "D"):
+                sheet.merge_cells(f"{column}{start + 2}:{column}{end + 2}")
+    centre = Alignment(vertical="center")
+    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, min_col=2, max_col=4):
+        for cell in row:
+            cell.alignment = centre
+
     for column, width in zip("ABCD", (22, 14, 10, 12)):
         sheet.column_dimensions[column].width = width
     sheet.freeze_panes = "A2"
