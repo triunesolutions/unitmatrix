@@ -27,6 +27,9 @@ STUDIO_LINE_RE = re.compile(r"^(STUDIO|STU)$", re.I)
 UNIT_NO_RE = re.compile(r"^\d{3,5}[A-Z]?$")
 # A unit number as printed in a room tag: 2101, MA-405, MI-501.
 UNIT_NUMBER_RE = re.compile(r"^[A-Z]{1,3}[-.]?\d{2,4}[A-Z]?$")
+# A unit type code in a room tag: MA1.2, MI2.2B, A1.0, 2C. Letters then a digit, so the
+# hyphenated unit number (MA-405) does not qualify.
+TYPE_CODE_RE = re.compile(r"^[A-Z]{0,4}\d[A-Z0-9.]*$")
 
 # How far (PDF points) around a UNIT TYPE line to look for the rest of its label stack.
 STACK_DX = 90
@@ -242,10 +245,16 @@ def detect_unit_tags(page: fitz.Page, page_number: int, names: list[str]) -> lis
         unit_no = next((l["text"].strip() for l in stack
                         if UNIT_NUMBER_RE.match(l["text"].strip())), "")
         named = next((l for l in stack if _token_key(l["text"].strip()) in wanted), None)
-        anchor = named or line
-        tags.append(_tag(page_number,
-                         wanted[_token_key(named["text"].strip())] if named else "",
-                         anchor, unit_no=unit_no))
+        if named is not None:
+            anchor, unit = named, wanted[_token_key(named["text"].strip())]
+        else:
+            # No name was supplied, or none matched. The type code is still usually printed
+            # in the stack, so take the one line shaped like a code and not the unit number.
+            code = next((l for l in stack
+                         if TYPE_CODE_RE.match(l["text"].strip())
+                         and l["text"].strip() != unit_no), None)
+            anchor, unit = (code, code["text"].strip()) if code else (line, "")
+        tags.append(_tag(page_number, unit, anchor, unit_no=unit_no))
     return _with_floor(page, _dedupe_positions(tags))
 
 

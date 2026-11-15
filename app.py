@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -207,54 +208,97 @@ def page_grid(prefix: str, pages: list[int], note=None) -> list[int]:
 
 # ---------------------------------------------------------------- 1. benchmark table
 st.subheader("1. The benchmark count table")
-st.caption("Point at the sheet holding the unit table you are checking against. Mechanical-only sets "
-           "often have none, in which case type the table in, or paste it from your own takeoff.")
+st.caption("The table you are checking against. Mechanical-only sets usually carry none, so paste it "
+           "from your own takeoff instead, or skip it and just count.")
 
-with st.expander("Which sheets have a unit table?"):
-    if st.button("Scan every page for tables"):
-        st.session_state.table_scan = pages_with_tables(file_hash, pdf)
-    scanned = st.session_state.get("table_scan")
-    if scanned:
-        st.write({f"page {p}": v for p, v in scanned.items()})
-    elif scanned == {}:
-        st.info("No unit table was recognised on any page of this set.")
+source = st.radio("Where is it?",
+                  ["Read it from a sheet", "Paste it in", "Skip — no benchmark table"],
+                  horizontal=True, key=f"bench_source_{file_hash}")
 
-pick_col, thumb_col = st.columns([2, 1])
-with pick_col:
-    bench_page = st.selectbox("Sheet with the table", ALL, format_func=page_label,
-                              key=f"bench_page_{file_hash}")
-    found = schedules_on(file_hash, pdf, bench_page)
-    if found:
-        choice = st.radio("Table on this sheet", range(len(found)),
-                          format_func=lambda i: f"{found[i]['title']} — {found[i]['total']} units, "
-                                                f"{len(found[i]['rows'])} rows",
-                          key=f"bench_choice_{file_hash}_{bench_page}")
-    else:
-        choice = None
-        st.info("No unit table recognised on this sheet. Pick another, or type the rows in below.")
-with thumb_col:
-    st.image(thumbnail(file_hash, pdf, bench_page), use_container_width=True)
+bench_rows: list[dict] = []
+if source == "Read it from a sheet":
+    with st.expander("Which sheets have a unit table?"):
+        if st.button("Scan every page for tables"):
+            st.session_state.table_scan = pages_with_tables(file_hash, pdf)
+        scanned = st.session_state.get("table_scan")
+        if scanned:
+            st.write({f"page {p}": v for p, v in scanned.items()})
+        elif scanned == {}:
+            st.info("No unit table was recognised on any page of this set. Paste it in instead.")
 
-parsed = found[choice]["rows"] if found and choice is not None else []
-bench_df = st.data_editor(
-    pd.DataFrame(parsed or [{"unit": "", "level": "", "qty": 0}]),
-    key=f"bench_editor_{file_hash}_{bench_page}_{choice}", num_rows="dynamic",
-    use_container_width=True, height=240,
-    column_config={
-        "unit": st.column_config.TextColumn("Unit", required=True),
-        "level": st.column_config.TextColumn("Level", help="Leave blank if the table gives no levels"),
-        "qty": st.column_config.NumberColumn("Benchmark qty", min_value=0, step=1),
-    },
-)
-bench_rows = [
-    {"unit": str(r["unit"]).strip(), "level": str(r.get("level") or "").strip(), "qty": int(r["qty"] or 0)}
-    for r in bench_df.to_dict("records")
-    if str(r.get("unit") or "").strip() and int(r.get("qty") or 0) > 0
-]
+    pick_col, thumb_col = st.columns([2, 1])
+    with pick_col:
+        bench_page = st.selectbox("Sheet with the table", ALL, format_func=page_label,
+                                  key=f"bench_page_{file_hash}")
+        found = schedules_on(file_hash, pdf, bench_page)
+        if found:
+            choice = st.radio("Table on this sheet", range(len(found)),
+                              format_func=lambda i: f"{found[i]['title']} — {found[i]['total']} units, "
+                                                    f"{len(found[i]['rows'])} rows",
+                              key=f"bench_choice_{file_hash}_{bench_page}")
+        else:
+            choice = None
+            st.info("No unit table on this sheet. Pick another, or switch to “Paste it in”.")
+    with thumb_col:
+        st.image(thumbnail(file_hash, pdf, bench_page), use_container_width=True)
+
+    parsed = found[choice]["rows"] if found and choice is not None else []
+    bench_df = st.data_editor(
+        pd.DataFrame(parsed or [{"unit": "", "level": "", "qty": 0}]),
+        key=f"bench_editor_{file_hash}_{bench_page}_{choice}", num_rows="dynamic",
+        use_container_width=True, height=240,
+        column_config={
+            "unit": st.column_config.TextColumn("Unit", required=True),
+            "level": st.column_config.TextColumn("Level", help="Blank if the table gives no levels"),
+            "qty": st.column_config.NumberColumn("Benchmark qty", min_value=0, step=1),
+        },
+    )
+    bench_rows = [{"unit": str(r["unit"]).strip(), "level": str(r.get("level") or "").strip(),
+                   "qty": int(r["qty"] or 0)}
+                  for r in bench_df.to_dict("records")
+                  if str(r.get("unit") or "").strip() and int(r.get("qty") or 0) > 0]
+
+elif source == "Paste it in":
+    st.caption("One unit per line: name then quantity, separated by a tab, comma or spaces. "
+               "Paste straight from Excel. A middle column, if present, is read as the level.")
+    pasted = st.text_area("Benchmark rows", height=220, key=f"bench_paste_{file_hash}",
+                          placeholder="MA0.1\t2\nMA1.1\t1\nMA1.1A\t1")
+    bad = 0
+    for line in pasted.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        # Split on the clearest separator present, so a name with a space ("PLAN 1A")
+        # survives: only fall back to the final run of spaces before the quantity.
+        if "\t" in raw:
+            parts = raw.split("\t")
+        elif "," in raw:
+            parts = raw.split(",")
+        elif re.search(r"\s{2,}", raw):
+            parts = re.split(r"\s{2,}", raw)
+        else:
+            trailing = re.match(r"^(.*\S)\s+(\d+)$", raw)
+            parts = [trailing.group(1), trailing.group(2)] if trailing else [raw]
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) < 2:
+            bad += 1
+            continue
+        qty = parts[-1].replace(",", "")
+        if not qty.isdigit():
+            bad += 1
+            continue
+        bench_rows.append({"unit": " ".join(parts[:-2]) if len(parts) > 2 else parts[0],
+                           "level": parts[-2] if len(parts) > 2 else "",
+                           "qty": int(qty)})
+    if bad:
+        st.warning(f"{bad} line(s) had no quantity and were ignored.")
+
 bench_names = sorted({r["unit"] for r in bench_rows})
 if bench_names:
-    st.caption(f"{len(bench_rows)} rows · {sum(r['qty'] for r in bench_rows)} units · "
-               f"{len(bench_names)} unit names, which can seed the search below.")
+    st.success(f"{len(bench_rows)} rows · {sum(r['qty'] for r in bench_rows)} units · "
+               f"{len(bench_names)} unit names, used to seed the search below.")
+elif source != "Skip — no benchmark table":
+    st.caption("No rows yet — the comparison in step 5 needs them, but you can count without.")
 
 # ---------------------------------------------------------------- 2. floor plan pages
 st.subheader("2. Floor plan pages")
