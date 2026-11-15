@@ -25,6 +25,8 @@ INLINE_BED_RE =re.compile(r"-\s*(\d)\s*(?:BD|BED|BR|BEDROOM)S?\b", re.I)
 BED_LINE_RE = re.compile(r"^(\d)\s*(?:BD|BED|BR|BEDROOM)S?$", re.I)
 STUDIO_LINE_RE = re.compile(r"^(STUDIO|STU)$", re.I)
 UNIT_NO_RE = re.compile(r"^\d{3,5}[A-Z]?$")
+# A unit number as printed in a room tag: 2101, MA-405, MI-501.
+UNIT_NUMBER_RE = re.compile(r"^[A-Z]{1,3}[-.]?\d{2,4}[A-Z]?$")
 
 # How far (PDF points) around a UNIT TYPE line to look for the rest of its label stack.
 STACK_DX = 90
@@ -214,6 +216,45 @@ def _dedupe(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not any(k["unit"] == tag["unit"]
                    and math.hypot(k["x"] + k["w"] / 2 - cx, k["y"] + k["h"] / 2 - cy) < DUPLICATE_DISTANCE
                    for k in kept):
+            kept.append(tag)
+    return kept
+
+
+def detect_unit_tags(page: fitz.Page, page_number: int, names: list[str]) -> list[dict[str, Any]]:
+    """Every dwelling-unit room tag on the sheet, named only where a type code is printed.
+
+    A room tag belongs to a dwelling when its stack carries a bedroom count; corridors,
+    stairs and plant rooms carry none, so they drop out. Some sheets print no type code at
+    all (just "2 BR / MA-501"), and those units are returned unnamed rather than lost.
+    """
+    wanted = {_token_key(n): str(n).strip() for n in names if len(_token_key(n)) >= 2}
+    lines = _lines(page)
+    tags = []
+    for line in lines:
+        text = line["text"].strip()
+        # A numeric bedroom count only: a bare "STUDIO" also appears in notes and legends,
+        # where it does not mark a dwelling.
+        if not BED_LINE_RE.match(text):
+            continue
+        stack = [l for l in lines
+                 if abs(l["bbox"].x0 - line["bbox"].x0) <= STACK_DX
+                 and abs(l["bbox"].y0 - line["bbox"].y0) <= STACK_DY]
+        unit_no = next((l["text"].strip() for l in stack
+                        if UNIT_NUMBER_RE.match(l["text"].strip())), "")
+        named = next((l for l in stack if _token_key(l["text"].strip()) in wanted), None)
+        anchor = named or line
+        tags.append(_tag(page_number,
+                         wanted[_token_key(named["text"].strip())] if named else "",
+                         anchor, unit_no=unit_no))
+    return _with_floor(page, _dedupe_positions(tags))
+
+
+def _dedupe_positions(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop tags sharing a position, whatever their name (one room tag = one unit)."""
+    kept: list[dict[str, Any]] = []
+    for tag in tags:
+        cx, cy = tag["x"] + tag["w"] / 2, tag["y"] + tag["h"] / 2
+        if not any(math.hypot(k["x"] + k["w"] / 2 - cx, k["y"] + k["h"] / 2 - cy) < 12 for k in kept):
             kept.append(tag)
     return kept
 
