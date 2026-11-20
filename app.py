@@ -1,8 +1,16 @@
+"""Unit Matrix — Review build.
+
+Upload a drawing set, pick the floor-plan sheets, count the unit tags, then walk the
+manager through every detection one key-press at a time: Enter keeps it, the cross
+deletes it. Anything the program missed is added by clicking straight onto the sheet.
+
+Speed notes: the page picker is rendered only until the count is run, and the review and
+viewer are fragments, so a key-press reruns one block instead of the whole script.
+"""
 from __future__ import annotations
 
 import hashlib
 import math
-import re
 from pathlib import Path
 
 import pandas as pd
@@ -10,146 +18,183 @@ import pymupdf as fitz
 import streamlit as st
 from PIL import Image, ImageDraw
 
-from core.detect import (detect_names, detect_unit_tags, detect_unit_types, page_title,
-                         suggest_plan_pages)
-from core.export import build_pdf, build_xlsx, summarise
-from core.schedule import compare, find_schedules
+import streamlit.components.v1 as components
+
+from core.detect import detect_unit_tags, detect_unit_types, page_title
+from core.export import build_pdf, build_xlsx, label_of, summarise
+from core.match import merged_rows, parents
 from core.sheets import sheet_index
-from core.unitplans import (merged_rows, resolve, suggest_unit_plan_pages, unit_plan_map,
-                            unit_plan_titles)
+from core.unitlabels import detect_unit_labels, suggest_unit_label_pages
 
-st.set_page_config(page_title="Unit Matrix", page_icon="🏢", layout="wide")
+# Drag-and-drop matcher. A plain HTML/JS component served from the project, so it needs
+# no extra package: it speaks Streamlit's postMessage protocol directly.
+matcher = components.declare_component(
+    "unit_plan_matcher", path=str(Path(__file__).parent / "components" / "matcher"))
 
-PREVIEW_ZOOM = 0.6
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates as image_click
+except ImportError:  # click-to-place needs this component
+    image_click = None
+
+st.set_page_config(page_title="Unit Matrix — Review", page_icon="✅", layout="wide")
+
 THUMB_ZOOM = 0.16
 THUMB_COLUMNS = 5
-# One room tag is one unit; a tag found by its bedroom line and one found by its type code
-# sit a line or two apart in the same stack, so anything this close is the same unit.
+# The navigator is sized to a fixed width, whatever the sheet: these are 42"x30" drawings,
+# so a fixed zoom would give a 600px-wide "thumbnail".
+NAV_WIDTH = 230.0
+# The review crop: how much of the sheet to show around the tag, in PDF points.
+WINDOW = 260.0
+TAG_BOX = 26.0
+# The viewer pane, in screen pixels. Zoom changes how much of the sheet fits in it.
+VIEW_W, VIEW_H = 980, 660
+
+
+# ----------------------------------------------------------------- rendering helpers
+@st.cache_data(show_spinner=False, max_entries=512)
+def thumbnail(file_hash: str, _pdf: bytes, pn: int, zoom: float = THUMB_ZOOM) -> Image.Image:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def scan(file_hash: str, _pdf: bytes) -> tuple[int, dict[int, str], dict[int, dict],
+                                               dict[int, tuple[float, float]]]:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return (len(doc),
+                {i: page_title(p) for i, p in enumerate(doc, start=1)},
+                sheet_index(doc),
+                {i: (p.rect.width, p.rect.height) for i, p in enumerate(doc, start=1)})
+
+
+# One room tag is one unit; a tag found by its bedroom line and one found by its
+# "UNIT TYPE" label sit a line or two apart in the same stack, so anything this close is
+# the same unit and must not be counted twice.
 SAME_UNIT = 90.0
-COLUMNS = ["page", "unit", "floor_level", "unit_no", "matched_text", "x", "y", "w", "h", "source"]
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def scan(file_hash: str, _pdf: bytes) -> tuple[int, dict[int, int], dict[int, str]]:
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return len(doc), suggest_plan_pages(doc), {i: page_title(p) for i, p in enumerate(doc, start=1)}
+def count_page(page: fitz.Page, pn: int) -> list[dict]:
+    """Every dwelling tag on one sheet, from both label styles.
 
-
-@st.cache_data(show_spinner=False, max_entries=4)
-def sheet_info(file_hash: str, _pdf: bytes) -> dict[int, dict]:
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return sheet_index(doc)
-
-
-@st.cache_data(show_spinner=False, max_entries=4)
-def unit_plan_sheets(file_hash: str, _pdf: bytes) -> dict[int, int]:
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return suggest_unit_plan_pages(doc)
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def unit_plans_from(file_hash: str, _pdf: bytes, pages: tuple[int, ...]) -> tuple[dict, list]:
-    """Label->plan pairs and the plans drawn, read before the floor plans are counted."""
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return unit_plan_map(doc, list(pages), []), unit_plan_titles(doc, list(pages))
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def unit_counts(file_hash: str, _pdf: bytes, pages: tuple[int, ...]) -> dict[int, int]:
-    """How many dwelling room tags each sheet carries — the real count, not a guess."""
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return {pn: len(detect_unit_tags(doc[pn - 1], pn, [])) for pn in pages}
-
-
-@st.cache_data(show_spinner=False, max_entries=4)
-def schedules_on(file_hash: str, _pdf: bytes, pn: int) -> list[dict]:
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        return find_schedules(doc[pn - 1])
-
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def pages_with_tables(file_hash: str, _pdf: bytes) -> dict[int, list[str]]:
-    """Every sheet carrying something that parses as a unit count table."""
-    found = {}
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        for number, page in enumerate(doc, start=1):
-            tables = find_schedules(page)
-            if tables:
-                found[number] = [f"{t['title']} ({t['total']})" for t in tables]
+    Some sets stack a bedroom count in the room tag ("MA1.2 / 470 SF / 1 BED"); others
+    print a plain label ("UNIT TYPE A3a") and no bedroom line at all. Running only the
+    first found nothing on a set of the second kind, so both run and the results merge.
+    """
+    found = detect_unit_types(page, pn)
+    for tag in detect_unit_tags(page, pn, [t["unit"] for t in found]):
+        cx, cy = tag["x"] + tag["w"] / 2, tag["y"] + tag["h"] / 2
+        if not any(math.hypot(o["x"] + o["w"] / 2 - cx, o["y"] + o["h"] / 2 - cy) < SAME_UNIT
+                   for o in found):
+            found.append(tag)
     return found
 
 
+@st.cache_data(show_spinner=False, max_entries=512)
+def tag_counts(file_hash: str, _pdf: bytes, pn: int) -> int:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return len(count_page(doc[pn - 1], pn))
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def rotations(file_hash: str, _pdf: bytes) -> dict[int, tuple[tuple, tuple]]:
+    """Per page, the matrices between PDF space and what the viewer sees.
+
+    These sheets are saved rotated (/Rotate 270). Text is extracted in the page's own
+    unrotated space, while the rendered picture is upright, so a tag read at y=2366 on a
+    portrait 2160x3024 page has to be mapped before it can be drawn on a landscape
+    3024x2160 image — without it the boxes land in the wrong place, and a crop near the
+    far edge falls off the page entirely and renders as an empty image.
+    """
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return {i: (tuple(p.rotation_matrix), tuple(p.derotation_matrix))
+                for i, p in enumerate(doc, start=1)}
+
+
+def to_view(rot: dict, tag: dict) -> dict:
+    """The tag with its box mapped into the coordinates of the rendered page."""
+    forward = fitz.Matrix(*rot[int(tag["page"])][0])
+    box = (fitz.Rect(float(tag["x"]), float(tag["y"]),
+                     float(tag["x"]) + float(tag["w"]),
+                     float(tag["y"]) + float(tag["h"])) * forward).normalize()
+    return dict(tag, x=box.x0, y=box.y0, w=box.width, h=box.height)
+
+
+def from_view(rot: dict, pn: int, x: float, y: float) -> tuple[float, float]:
+    """A point clicked on the rendered page, back in the coordinates tags are stored in."""
+    point = fitz.Point(x, y) * fitz.Matrix(*rot[pn][1])
+    return point.x, point.y
+
+
 @st.cache_data(show_spinner=False, max_entries=256)
-def detect_page(file_hash: str, _pdf: bytes, pn: int, mode: str, names: tuple[str, ...],
-                include_unnamed: bool) -> list[dict]:
+def crop(file_hash: str, _pdf: bytes, pn: int, cx: float, cy: float,
+         width: float, height: float, zoom: float) -> tuple[Image.Image, tuple[float, float]]:
+    """A window of the sheet centred on (cx, cy), and the PDF point of its top-left corner."""
     with fitz.open(stream=_pdf, filetype="pdf") as doc:
         page = doc[pn - 1]
-        found = detect_unit_types(page, pn) if mode == "auto" else detect_names(page, pn, list(names))
-        if include_unnamed:
-            known = list(names) or [t["unit"] for t in found]
-            for tag in detect_unit_tags(page, pn, known):
-                if not any(_same_unit(tag, other) for other in found):
-                    found.append(tag)
-        return found
+        clip = fitz.Rect(cx - width / 2, cy - height / 2,
+                         cx + width / 2, cy + height / 2) & page.rect
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), (clip.x0, clip.y0)
 
 
-def _same_unit(a: dict, b: dict) -> bool:
-    return math.hypot(a["x"] + a["w"] / 2 - b["x"] - b["w"] / 2,
-                      a["y"] + a["h"] / 2 - b["y"] - b["h"] / 2) < SAME_UNIT
-
-
-def detect(pdf: bytes, file_hash: str, pages: list[int], mode: str, names: tuple[str, ...],
-           include_unnamed: bool) -> list[dict]:
-    tags = []
-    progress = st.progress(0.0, text="Scanning pages…")
-    for n, pn in enumerate(pages, start=1):
-        tags += detect_page(file_hash, pdf, pn, mode, names, include_unnamed)
-        progress.progress(n / len(pages), text=f"Scanned page {pn} ({n} of {len(pages)})")
-    progress.empty()
-    return tags
-
-
-@st.cache_data(show_spinner=False, max_entries=512)
-def thumbnail(file_hash: str, _pdf: bytes, pn: int) -> Image.Image:
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(THUMB_ZOOM, THUMB_ZOOM), alpha=False)
-        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-
-@st.cache_data(show_spinner=False, max_entries=16)
-def page_image(file_hash: str, _pdf: bytes, pn: int) -> Image.Image:
-    with fitz.open(stream=_pdf, filetype="pdf") as doc:
-        pix = doc[pn - 1].get_pixmap(matrix=fitz.Matrix(PREVIEW_ZOOM, PREVIEW_ZOOM), alpha=False)
-        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-
-def clean(df: pd.DataFrame) -> list[dict]:
-    """Rows from the editor -> tags. A unit whose type code is not printed keeps a blank
-    name, so it is still counted and still visible as one to name."""
-    df = df.copy()
-    df["unit"] = df["unit"].fillna("").astype(str).str.strip()
-    df = df[df["page"].notna()]
-    df = df.fillna({"x": 40.0, "y": 40.0, "w": 10.0, "h": 10.0, "floor_level": "",
-                    "unit_no": "", "matched_text": "", "source": "manual"})
-    df["page"] = df["page"].astype(int)
-    return df.to_dict("records")
-
-
-def preview(image: Image.Image, tags: list[dict]) -> Image.Image:
+def draw_tags(image: Image.Image, tags: list[dict], zoom: float,
+              origin: tuple[float, float] = (0.0, 0.0), highlight: int | None = None) -> Image.Image:
+    """Mark tags on a rendered image. `origin` is the PDF point of its top-left corner."""
     image = image.copy()
-    draw = ImageDraw.Draw(image)
-    for t in tags:
-        x0, y0 = t["x"] * PREVIEW_ZOOM, t["y"] * PREVIEW_ZOOM
-        x1, y1 = (t["x"] + t["w"]) * PREVIEW_ZOOM, (t["y"] + t["h"]) * PREVIEW_ZOOM
-        colour = (220, 0, 0) if str(t.get("unit") or "").strip() else (230, 140, 0)
-        draw.rectangle((x0 - 3, y0 - 3, x1 + 3, y1 + 3), outline=colour, width=3)
-        draw.text((x0, y0 - 14), str(t.get("unit") or "?"), fill=colour)
+    pen = ImageDraw.Draw(image)
+    ox, oy = origin
+    for tag in tags:
+        cx = (float(tag["x"]) + float(tag["w"]) / 2 - ox) * zoom
+        cy = (float(tag["y"]) + float(tag["h"]) / 2 - oy) * zoom
+        half = TAG_BOX / 2 * zoom
+        current = highlight is not None and tag.get("_i") == highlight
+        colour = (220, 0, 0) if current else (40, 120, 215)
+        pen.rectangle((cx - half, cy - half, cx + half, cy + half),
+                      outline=colour, width=4 if current else 2)
+        pen.text((cx - half, cy - half - 12), label_of(tag), fill=colour)
     return image
 
 
-st.title("Unit Matrix")
-st.caption("Read the benchmark table, count the units on the mechanical floor plans, map them to the "
-           "unit plans, and export the matrix with a Bluebeam-countable PDF.")
+def reindex(store: str = "tags") -> list[dict]:
+    tags = st.session_state.get(store) or []
+    for i, tag in enumerate(tags):
+        tag["_i"] = i
+    return tags
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def unit_label_pages(file_hash: str, _pdf: bytes) -> dict[int, int]:
+    with fitz.open(stream=_pdf, filetype="pdf") as doc:
+        return suggest_unit_label_pages(doc)
+
+
+def new_tag(page: int, x: float, y: float, name: str, floor: str) -> dict:
+    return {"page": page, "unit": name, "unit_no": "", "matched_text": "added by hand",
+            "x": x - TAG_BOX / 2, "y": y - TAG_BOX / 2, "w": TAG_BOX, "h": TAG_BOX,
+            "source": "manual", "floor_level": floor}
+
+
+def fresh_click(key: str, click) -> tuple[float, float] | None:
+    """The click coordinates, but only the first time this exact click is seen.
+
+    The component replays its last value on every rerun, so without this a single click
+    would keep re-firing.
+    """
+    if not click:
+        return None
+    seen = st.session_state.setdefault("clicks", {})
+    point = (click["x"], click["y"])
+    if seen.get(key) == point:
+        return None
+    seen[key] = point
+    return point
+
+
+# ----------------------------------------------------------------- 0. upload
+st.title("Unit Matrix — count and review")
+st.caption("Count the unit tags on the floor plans, then check every one: Enter keeps it, the "
+           "cross deletes it, and a click on the sheet adds one the program missed.")
 
 uploaded = st.file_uploader("Upload the drawing set (PDF)", type=["pdf"])
 if not uploaded:
@@ -159,12 +204,13 @@ if not uploaded:
 pdf = uploaded.getvalue()
 file_hash = hashlib.md5(pdf).hexdigest()
 if st.session_state.get("file_hash") != file_hash:
-    st.session_state.update(file_hash=file_hash, tags=None, detection_message=None, tagged_pdf=None)
+    st.session_state.update(file_hash=file_hash, tags=None, pages=None, cursor=0,
+                            tagged_pdf=None, clicks={}, centre={}, pending=None,
+                            pick_pages=True, units=None, unit_pages=None, units_cursor=0)
 
 with st.spinner("Reading the PDF…"):
-    page_count, suggested, titles = scan(file_hash, pdf)
-    sheets = sheet_info(file_hash, pdf)
-
+    page_count, titles, sheets, page_sizes = scan(file_hash, pdf)
+    ROT = rotations(file_hash, pdf)
 ALL = list(range(1, page_count + 1))
 
 
@@ -177,322 +223,333 @@ def page_label(pn: int) -> str:
     return " · ".join(bits)
 
 
-def page_grid(prefix: str, pages: list[int], note=None) -> list[int]:
-    """A tick box under a picture of every page. The boxes are the single source of truth,
-    so the buttons are drawn first and set their state before the boxes exist this run."""
-    def key(pn: int) -> str:
-        return f"{prefix}_{file_hash}_{pn}"
+def key_of(pn: int) -> str:
+    return f"floor_{file_hash}_{pn}"
 
-    select_col, clear_col, thumbs_col, count_col = st.columns([1, 1, 1.2, 1.6])
-    with select_col:
-        select_all = st.button("Select all listed", key=f"{prefix}_all", use_container_width=True)
-    with clear_col:
-        clear_all = st.button("Clear selection", key=f"{prefix}_clear", use_container_width=True)
-    with thumbs_col:
-        show_thumbs = st.toggle("Show page images", value=True, key=f"{prefix}_thumbs")
-    for pn in pages:
+
+# ----------------------------------------------------------------- 1. pick the pages
+# Rendered only while choosing. Once the count is in, the thumbnail grid is dropped from
+# the script entirely — redrawing 60 page images on every key-press was the slowness.
+st.subheader("1. Floor-plan pages")
+
+if st.session_state.get("pick_pages", True):
+    select_col, clear_col, thumb_col, count_col = st.columns([1, 1, 1.2, 1.8])
+    select_all = select_col.button("Select all", use_container_width=True)
+    clear_all = clear_col.button("Clear selection", use_container_width=True)
+    show_thumbs = thumb_col.toggle("Show page images", value=True)
+    for pn in ALL:
         if select_all:
-            st.session_state[key(pn)] = True
+            st.session_state[key_of(pn)] = True
         elif clear_all:
-            st.session_state[key(pn)] = False
-    with count_col:
-        chosen = sum(1 for pn in pages if st.session_state.get(key(pn)))
-        st.caption(f"**{chosen} of {len(pages)} listed pages selected**")
+            st.session_state[key_of(pn)] = False
+    chosen = [pn for pn in ALL if st.session_state.get(key_of(pn))]
+    count_col.caption(f"**{len(chosen)} of {page_count} pages selected**")
 
+    show_counts = st.toggle("Show how many tags each page holds (slower)", value=False)
     columns_per_row = THUMB_COLUMNS if show_thumbs else 2
-    with st.spinner("Rendering page images…" if show_thumbs else "Listing pages…"):
-        for start in range(0, len(pages), columns_per_row):
-            for column, pn in zip(st.columns(columns_per_row), pages[start:start + columns_per_row]):
+    with st.spinner("Rendering pages…"):
+        for start in range(0, len(ALL), columns_per_row):
+            for column, pn in zip(st.columns(columns_per_row), ALL[start:start + columns_per_row]):
                 with column:
+                    note = f" · {tag_counts(file_hash, pdf, pn)} tags" if show_counts else ""
                     if show_thumbs:
                         st.image(thumbnail(file_hash, pdf, pn), use_container_width=True)
-                        extra = note(pn) if note else ""
-                        st.checkbox(f"**{pn}** · {sheets.get(pn, {}).get('sheet') or '—'}" + extra,
-                                    key=key(pn), help=page_label(pn))
+                        st.checkbox(f"**{pn}** · {sheets.get(pn, {}).get('sheet') or '—'}{note}",
+                                    key=key_of(pn), help=page_label(pn))
                     else:
-                        st.checkbox(page_label(pn) + (note(pn) if note else ""), key=key(pn))
-    return [pn for pn in pages if st.session_state.get(key(pn))]
+                        st.checkbox(page_label(pn) + note, key=key_of(pn))
+    chosen = [pn for pn in ALL if st.session_state.get(key_of(pn))]
 
-
-# ---------------------------------------------------------------- 1. benchmark table
-st.subheader("1. The benchmark count table")
-st.caption("The table you are checking against. Mechanical-only sets usually carry none, so paste it "
-           "from your own takeoff instead, or skip it and just count.")
-
-source = st.radio("Where is it?",
-                  ["Read it from a sheet", "Paste it in", "Skip — no benchmark table"],
-                  horizontal=True, key=f"bench_source_{file_hash}")
-
-bench_rows: list[dict] = []
-if source == "Read it from a sheet":
-    with st.expander("Which sheets have a unit table?"):
-        if st.button("Scan every page for tables"):
-            st.session_state.table_scan = pages_with_tables(file_hash, pdf)
-        scanned = st.session_state.get("table_scan")
-        if scanned:
-            st.write({f"page {p}": v for p, v in scanned.items()})
-        elif scanned == {}:
-            st.info("No unit table was recognised on any page of this set. Paste it in instead.")
-
-    pick_col, thumb_col = st.columns([2, 1])
-    with pick_col:
-        bench_page = st.selectbox("Sheet with the table", ALL, format_func=page_label,
-                                  key=f"bench_page_{file_hash}")
-        found = schedules_on(file_hash, pdf, bench_page)
-        if found:
-            choice = st.radio("Table on this sheet", range(len(found)),
-                              format_func=lambda i: f"{found[i]['title']} — {found[i]['total']} units, "
-                                                    f"{len(found[i]['rows'])} rows",
-                              key=f"bench_choice_{file_hash}_{bench_page}")
-        else:
-            choice = None
-            st.info("No unit table on this sheet. Pick another, or switch to “Paste it in”.")
-    with thumb_col:
-        st.image(thumbnail(file_hash, pdf, bench_page), use_container_width=True)
-
-    parsed = found[choice]["rows"] if found and choice is not None else []
-    bench_df = st.data_editor(
-        pd.DataFrame(parsed or [{"unit": "", "level": "", "qty": 0}]),
-        key=f"bench_editor_{file_hash}_{bench_page}_{choice}", num_rows="dynamic",
-        use_container_width=True, height=240,
-        column_config={
-            "unit": st.column_config.TextColumn("Unit", required=True),
-            "level": st.column_config.TextColumn("Level", help="Blank if the table gives no levels"),
-            "qty": st.column_config.NumberColumn("Benchmark qty", min_value=0, step=1),
-        },
-    )
-    bench_rows = [{"unit": str(r["unit"]).strip(), "level": str(r.get("level") or "").strip(),
-                   "qty": int(r["qty"] or 0)}
-                  for r in bench_df.to_dict("records")
-                  if str(r.get("unit") or "").strip() and int(r.get("qty") or 0) > 0]
-
-elif source == "Paste it in":
-    st.caption("One unit per line: name then quantity, separated by a tab, comma or spaces. "
-               "Paste straight from Excel. A middle column, if present, is read as the level.")
-    pasted = st.text_area("Benchmark rows", height=220, key=f"bench_paste_{file_hash}",
-                          placeholder="MA0.1\t2\nMA1.1\t1\nMA1.1A\t1")
-    bad = 0
-    for line in pasted.splitlines():
-        raw = line.strip()
-        if not raw:
-            continue
-        # Split on the clearest separator present, so a name with a space ("PLAN 1A")
-        # survives: only fall back to the final run of spaces before the quantity.
-        if "\t" in raw:
-            parts = raw.split("\t")
-        elif "," in raw:
-            parts = raw.split(",")
-        elif re.search(r"\s{2,}", raw):
-            parts = re.split(r"\s{2,}", raw)
-        else:
-            trailing = re.match(r"^(.*\S)\s+(\d+)$", raw)
-            parts = [trailing.group(1), trailing.group(2)] if trailing else [raw]
-        parts = [p.strip() for p in parts if p.strip()]
-        if len(parts) < 2:
-            bad += 1
-            continue
-        qty = parts[-1].replace(",", "")
-        if not qty.isdigit():
-            bad += 1
-            continue
-        bench_rows.append({"unit": " ".join(parts[:-2]) if len(parts) > 2 else parts[0],
-                           "level": parts[-2] if len(parts) > 2 else "",
-                           "qty": int(qty)})
-    if bad:
-        st.warning(f"{bad} line(s) had no quantity and were ignored.")
-
-bench_names = sorted({r["unit"] for r in bench_rows})
-if bench_names:
-    st.success(f"{len(bench_rows)} rows · {sum(r['qty'] for r in bench_rows)} units · "
-               f"{len(bench_names)} unit names, used to seed the search below.")
-elif source != "Skip — no benchmark table":
-    st.caption("No rows yet — the comparison in step 5 needs them, but you can count without.")
-
-# ---------------------------------------------------------------- 2. unit plan sheets
-st.subheader("2. Unit plan sheets")
-st.caption("The enlarged plans, one per unit type. The title sits underneath (“UNIT MI1.2A”) and the "
-           "greyed room tag inside names the floor-plan label it was drawn from, which is what says "
-           "which label bills against which unit plan. These sheets are only read for that mapping — "
-           "nothing on them is counted.")
-plan_suggested = unit_plan_sheets(file_hash, pdf)
-plan_pages = page_grid("uplan", ALL,
-                       note=lambda pn: f" · {plan_suggested[pn]} plans" if pn in plan_suggested else "")
-tag_map, plan_titles = unit_plans_from(file_hash, pdf, tuple(sorted(plan_pages))) if plan_pages else ({}, [])
-if plan_pages:
-    st.success(f"{len(plan_titles)} unit plans drawn on {len(plan_pages)} sheet(s); "
-               f"{len(tag_map)} of them name a label in their room tag.")
-else:
-    st.caption("None selected — every label will bill against itself.")
-
-# ---------------------------------------------------------------- 3. floor plan pages
-st.subheader("3. Floor plan pages")
-mode_label = st.radio("How are units labelled on the plans?",
-                      ["Auto: unit labels on the plans (UNIT TYPE 2C + 3BD, UNIT A1.0, …)",
-                       "Match my list of unit names"], horizontal=True)
-mode = "auto" if mode_label.startswith("Auto") else "names"
-names: list[str] = []
-if mode == "names":
-    names = [n.strip() for n in st.text_area(
-        "Unit names to find, one per line, exactly as written on the plans",
-        value="\n".join(bench_names), placeholder="A1\nA1 TYPE A\nA2 END",
-        key=f"names_{file_hash}").splitlines() if n.strip()]
-
-include_unnamed = st.checkbox(
-    "Also count units whose type code is not printed", value=True,
-    help="Some sheets tag a unit only as “2 BR / MA-501”. These are counted and left blank "
-         "for you to name in the review table.")
-
-mechanical = [p for p in ALL if sheets.get(p, {}).get("mechanical")]
-only_mech = st.checkbox(
-    f"Show mechanical sheets only ({len(mechanical)} of {page_count}: "
-    f"{', '.join(sorted({sheets[p]['discipline'] for p in mechanical})) or 'none found'})",
-    value=bool(mechanical), help="Mechanical and HVAC sheet numbers (M…, H…) from each title block.")
-st.caption("Tick only the floor plans to count. Each sheet shows how many dwelling room tags it "
-           "actually holds. Where two sheet families cover the same units — ductwork and condensate, "
-           "or overall and enlarged — take one family only, or every unit counts twice.")
-
-listed = mechanical if (only_mech and mechanical) else ALL
-with st.spinner("Counting room tags on each sheet…"):
-    per_page = unit_counts(file_hash, pdf, tuple(listed))
-floor_pages = page_grid("floor", listed,
-                        note=lambda pn: f" · **{per_page[pn]} units**" if per_page.get(pn) else "")
-if floor_pages:
-    st.caption("Selected: " + ", ".join(f"{p} ({per_page.get(p, 0)})" for p in floor_pages)
-               + f" — {sum(per_page.get(p, 0) for p in floor_pages)} units in total")
-    # Two sheet families covering the same units give the same per-sheet counts twice over.
-    series = {}
-    for p in floor_pages:
-        series.setdefault(sheets.get(p, {}).get("series") or "?", []).append(per_page.get(p, 0))
-    busy = {s: v for s, v in series.items() if sum(v)}
-    if len(busy) > 1:
-        st.warning("Selected sheets span " + ", ".join(f"{s} ({sum(v)} units)" for s, v in busy.items())
-                   + ". If these families draw the same units, the count will be doubled.")
-
-if st.button("Count units", type="primary",
-             disabled=not floor_pages or (mode == "names" and not names)):
-    detected = detect(pdf, file_hash, sorted(floor_pages), mode, tuple(names), include_unnamed)
-    if detected:
-        st.session_state.tags = pd.DataFrame(detected, columns=COLUMNS)
-        blank = sum(1 for t in detected if not str(t.get("unit") or "").strip())
-        st.session_state.detection_message = (
-            f"Counted {len(detected)} units across {len(floor_pages)} sheet(s)."
-            + (f" {blank} have no type code printed and need naming." if blank else ""))
-    else:
-        st.session_state.tags = None
-        st.session_state.detection_message = (
-            f"No units found on pages {', '.join(map(str, sorted(floor_pages)))}. Check these are floor "
-            "plans and that the mode matches how the drawings label units.")
-
-if st.session_state.get("detection_message"):
-    (st.warning if st.session_state.get("tags") is None else st.success)(st.session_state.detection_message)
-if st.session_state.get("tags") is None:
+    if chosen and st.button(f"Count units on {len(chosen)} page(s)", type="primary"):
+        found: list[dict] = []
+        progress = st.progress(0.0, text="Scanning…")
+        with fitz.open(stream=pdf, filetype="pdf") as doc:
+            for n, pn in enumerate(chosen, start=1):
+                found += count_page(doc[pn - 1], pn)
+                progress.progress(n / len(chosen), text=f"Page {pn} ({n} of {len(chosen)})")
+        progress.empty()
+        st.session_state.update(tags=found, pages=chosen, cursor=0,
+                                tagged_pdf=None, pick_pages=False, pending=None)
+        st.rerun()
     st.stop()
 
-# ---------------------------------------------------------------- 4. review
-st.subheader("4. Review units")
-st.caption("Name any blank unit, fix names, delete false hits (select rows → delete), or add missed "
-           "units at the bottom. Orange boxes on the preview are units with no type code printed.")
-left, right = st.columns([2, 3])
-with left:
-    edited = st.data_editor(
-        st.session_state.tags, key=f"editor_{file_hash}", num_rows="dynamic", use_container_width=True,
-        height=520, column_order=["page", "unit", "unit_no", "floor_level", "matched_text"],
-        column_config={
-            "page": st.column_config.NumberColumn("Page", min_value=1, max_value=page_count, step=1, required=True),
-            "unit": st.column_config.TextColumn("Unit"),
-            "unit_no": st.column_config.TextColumn("Unit no.", disabled=True),
-            "floor_level": st.column_config.TextColumn("Floor / Level"),
-            "matched_text": st.column_config.TextColumn("Text on plan", disabled=True),
-        },
-    )
-tags = clean(edited)
-named = [t for t in tags if str(t.get("unit") or "").strip()]
-with right:
-    tag_pages = sorted({t["page"] for t in tags}) or sorted(floor_pages)
-    shown = st.selectbox("Preview page", tag_pages, format_func=page_label)
-    st.image(preview(page_image(file_hash, pdf, shown), [t for t in tags if t["page"] == shown]),
-             use_container_width=True)
-blank = len(tags) - len(named)
-if blank:
-    st.warning(f"{blank} unit(s) still have no name. They count towards the total but cannot be "
-               "matched to the benchmark or to a unit plan until you name them.")
+chosen = st.session_state.pages
+summary_col, change_col = st.columns([4, 1])
+summary_col.caption("Counting pages " + ", ".join(str(p) for p in chosen))
+if change_col.button("Change pages", use_container_width=True):
+    st.session_state.pick_pages = True
+    st.rerun()
 
-# ---------------------------------------------------------------- 5. merged pivot
-st.subheader("5. Merged pivot")
-st.caption("Each counted label against the unit plan it bills to, from the sheets picked in step 2. "
-           "A label the room tags do not name takes the plan drawn for the same base unit; one with "
-           "none bills against itself. Correct any row.")
-summary = summarise(named)
-derived = resolve([u for u, _ in summary], tag_map, plan_titles)
+tags = reindex()
+st.success(f"**{len(tags)} units** found across {len({t['page'] for t in tags})} page(s).")
+st.caption(" · ".join(f"page {pn}: {sum(1 for t in tags if t['page'] == pn)}"
+                      for pn in sorted({t["page"] for t in tags})))
 
-map_df = st.data_editor(
-    pd.DataFrame([{"Label": u, "UNIT PLAN": derived.get(u, {}).get("plan", ""),
-                   "read from": derived.get(u, {}).get("source", ""),
-                   "sheet": derived.get(u, {}).get("page", "")} for u, _ in summary]),
-    key=f"plan_map_{file_hash}_{tuple(sorted(plan_pages))}", use_container_width=True, height=300,
-    column_config={
-        "Label": st.column_config.TextColumn("Label", disabled=True),
-        "UNIT PLAN": st.column_config.TextColumn("UNIT PLAN"),
-        "read from": st.column_config.TextColumn("read from", disabled=True),
-        "sheet": st.column_config.NumberColumn("sheet", disabled=True),
-    },
-)
-plan_map = {str(r["Label"]): str(r["UNIT PLAN"] or "").strip()
-            for r in map_df.to_dict("records") if str(r.get("Label") or "").strip()}
-pivot_rows = merged_rows(summary, plan_map)
-st.dataframe(pd.DataFrame(pivot_rows + [{"Label": "GRAND TOTAL OF UNITS", "UNIT PLAN": "",
-                                         "Total": sum(r["Total"] for r in pivot_rows),
-                                         "MERG QTY": sum(r["MERG QTY"] for r in pivot_rows
-                                                         if r["MERG QTY"] != "")}]),
-             hide_index=True, use_container_width=True)
+# ----------------------------------------------------------------- 2. walkthrough
+st.subheader("2. Check every tag")
+st.caption("Enter keeps the tag and moves on. The cross deletes a wrong one. Correct the name "
+           "in the box first if it is wrong.")
 
-# ---------------------------------------------------------------- 6. comparison + export
-st.subheader("6. Comparison and export")
-result = compare(bench_rows, named) if bench_rows else None
 
-if result:
-    gap = result["counted_total"] - result["architect_total"]
-    headline = (f"Benchmark {result['architect_total']} · counted {result['counted_total']}"
-                + (f" (+{blank} unnamed)" if blank else "") + f" · variance {gap:+d}")
-    mismatched = [r for r in result["by_unit"] if r["CHECK"] != "OK"]
-    if gap == 0 and not mismatched:
-        st.success(headline + " — every unit type matches.")
-    else:
-        st.warning(headline + f" — {len(mismatched)} unit type(s) differ.")
-    by_type, by_level = st.tabs(["By unit type", "By unit and level"])
-    with by_type:
-        st.dataframe(pd.DataFrame(result["by_unit"]), hide_index=True, use_container_width=True)
-    with by_level:
-        if result["by_level"]:
-            st.dataframe(pd.DataFrame(result["by_level"]), hide_index=True, use_container_width=True)
-        else:
-            st.caption("The benchmark table gives no levels, so there is nothing to compare per level.")
+@st.fragment
+def walkthrough(store: str = "tags", cursor_key: str = "cursor", word: str = "Tag") -> None:
+    tags = reindex(store)
+    if not tags:
+        st.warning(f"No {word.lower()}s left.")
+        return
+    cursor = min(st.session_state.get(cursor_key, 0), len(tags) - 1)
+    st.session_state[cursor_key] = cursor
+    tag = tags[cursor]
+
+    head, zoom_col = st.columns([3, 1])
+    head.markdown(f"**{word} {cursor + 1} of {len(tags)}** — page {tag['page']} "
+                  f"({sheets.get(tag['page'], {}).get('sheet') or '—'}) · "
+                  f"{tag.get('floor_level') or 'level not identified'}")
+    zoom = zoom_col.slider("Zoom", 1.0, 4.0, 2.0, 0.5, key=f"walk_zoom_{store}")
+    st.progress((cursor + 1) / len(tags))
+
+    # Everything drawn or cropped works in the coordinates of the rendered page.
+    shown = to_view(ROT, tag)
+    cx = shown["x"] + shown["w"] / 2
+    cy = shown["y"] + shown["h"] / 2
+    image, origin = crop(file_hash, pdf, tag["page"], cx, cy, WINDOW, WINDOW, zoom)
+    nearby = [v for v in (to_view(ROT, t) for t in tags if t["page"] == tag["page"])
+              if abs(v["x"] - cx) < WINDOW and abs(v["y"] - cy) < WINDOW]
+
+    view, side = st.columns([2, 1])
+    view.image(draw_tags(image, nearby, zoom, origin, highlight=cursor))
+    with side:
+        st.caption(f"Read from the sheet: `{tag.get('matched_text') or '—'}`")
+        if tag.get("unit_no"):
+            st.caption(f"Unit number: `{tag['unit_no']}`")
+        with st.form(f"review_{store}_{cursor}", clear_on_submit=False, border=False):
+            name = st.text_input(f"{word} name", value=label_of(tag),
+                                 key=f"name_{store}_{cursor}")
+            keep = st.form_submit_button("✔ Keep and next  (Enter)", type="primary",
+                                         use_container_width=True)
+            drop = st.form_submit_button(f"✖ Wrong — delete this {word.lower()}",
+                                         use_container_width=True)
+        back_col, end_col = st.columns(2)
+        back = back_col.button("← Back", use_container_width=True, disabled=cursor == 0,
+                               key=f"back_{store}")
+        jump = end_col.button(f"Last {word.lower()}", use_container_width=True,
+                              key=f"jump_{store}")
+
+    # Render the next tag's window now, while the manager is still reading this one, so the
+    # key-press finds it already in the cache.
+    if cursor + 1 < len(tags):
+        nxt = to_view(ROT, tags[cursor + 1])
+        crop(file_hash, pdf, nxt["page"], nxt["x"] + nxt["w"] / 2, nxt["y"] + nxt["h"] / 2,
+             WINDOW, WINDOW, zoom)
+
+    if keep:
+        clean = name.strip()
+        tag["unit"] = "" if clean in ("", "?") else clean
+        st.session_state[cursor_key] = min(cursor + 1, len(tags) - 1)
+        st.rerun(scope="fragment")
+    if drop:
+        st.session_state[store] = [t for t in tags if t["_i"] != cursor]
+        st.session_state[cursor_key] = min(cursor, max(len(st.session_state[store]) - 1, 0))
+        st.rerun()
+    if back:
+        st.session_state[cursor_key] = cursor - 1
+        st.rerun(scope="fragment")
+    if jump:
+        st.session_state[cursor_key] = len(tags) - 1
+        st.rerun(scope="fragment")
+
+
+walkthrough()
+
+# ----------------------------------------------------------------- 3. add a missed tag
+st.subheader("3. Add anything the program missed")
+
+if image_click is None:
+    st.error("Click-to-place needs one package that is not installed yet. "
+             "`streamlit.exe` and `pip.exe` are blocked by Application Control on this "
+             "laptop, so run it through Python instead:")
+    st.code(r'..\code\.venv\Scripts\python.exe -m pip install streamlit-image-coordinates',
+            language="powershell")
+    st.caption("Then stop the app and start it again with "
+               "`python -m streamlit run app.py`.")
 else:
-    st.caption("Fill in the benchmark table in step 1 to see the comparison.")
+    st.caption("The small sheet on the left is the whole page — click it to move the view. "
+               "The large pane is the sheet itself: click where a tag is missing, name it, "
+               "press Enter. Zoom changes how much of the sheet the pane holds.")
 
-by_floor: dict[str, int] = {}
-for t in sorted(tags, key=lambda t: t["page"]):
-    by_floor[str(t.get("floor_level") or "").strip() or "Not identified"] = \
-        by_floor.get(str(t.get("floor_level") or "").strip() or "Not identified", 0) + 1
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    st.caption("Our count by unit type")
-    st.dataframe(pd.DataFrame(summary + [("Grand Total", sum(q for _, q in summary))],
-                              columns=["UNIT", "Total"]), hide_index=True, use_container_width=True)
-with c2:
-    st.caption("Our count by floor")
-    st.dataframe(pd.DataFrame(list(by_floor.items()), columns=["FLOOR / LEVEL", "Total"]),
-                 hide_index=True, use_container_width=True)
-with c3:
+    @st.fragment
+    def viewer() -> None:
+        # Unit-plan sheets are offered too, so a missed unit label can be clicked in the
+        # same way. A click on one of those pages adds to the unit labels, not the units.
+        label_pages = st.session_state.get("unit_pages") or []
+        pages = list(dict.fromkeys(list(chosen) + list(label_pages)))
+        pick, zoom_col = st.columns([3, 1])
+        pn = pick.selectbox("Page", pages, format_func=page_label, key="add_page")
+        zoom = zoom_col.slider("Zoom", 0.5, 6.0, 2.0, 0.5, key="add_zoom")
+        store = "units" if pn in label_pages and pn not in chosen else "tags"
+        tags = reindex(store)
+        if store == "units":
+            st.caption("This is a unit-plan sheet — anything added here joins the unit labels.")
+
+        width, height = page_sizes[pn]
+        centre = st.session_state.centre.get(pn) or (width / 2, height / 2)
+        # How much of the sheet fits the pane at this zoom.
+        span_w, span_h = VIEW_W / zoom, VIEW_H / zoom
+        cx = min(max(centre[0], span_w / 2), max(width - span_w / 2, span_w / 2))
+        cy = min(max(centre[1], span_h / 2), max(height - span_h / 2, span_h / 2))
+
+        on_page = [t for t in tags if t["page"] == pn]
+        # Drawn against the rendered page, so rotated sheets line up.
+        shown_tags = [to_view(ROT, t) for t in on_page]
+        nav_col, main_col = st.columns([1, 4])
+
+        nav_zoom = NAV_WIDTH / width
+        with nav_col:
+            nav = thumbnail(file_hash, pdf, pn, nav_zoom).copy()
+            pen = ImageDraw.Draw(nav)
+            pen.rectangle(((cx - span_w / 2) * nav_zoom, (cy - span_h / 2) * nav_zoom,
+                           (cx + span_w / 2) * nav_zoom, (cy + span_h / 2) * nav_zoom),
+                          outline=(220, 0, 0), width=2)
+            for tag in shown_tags:
+                tx = (tag["x"] + tag["w"] / 2) * nav_zoom
+                ty = (tag["y"] + tag["h"] / 2) * nav_zoom
+                pen.ellipse((tx - 2, ty - 2, tx + 2, ty + 2), fill=(40, 120, 215))
+            moved = fresh_click(f"nav_{pn}", image_click(nav, key=f"nav_{pn}_{zoom:.1f}"))
+            st.caption("Click to move the view")
+
+        if moved:
+            st.session_state.centre[pn] = (moved[0] / nav_zoom, moved[1] / nav_zoom)
+            st.rerun(scope="fragment")
+
+        with main_col:
+            image, origin = crop(file_hash, pdf, pn, cx, cy, span_w, span_h, zoom)
+            placed = fresh_click(
+                f"main_{pn}",
+                image_click(draw_tags(image, shown_tags, zoom, origin), key=f"main_{pn}_{zoom}_{cx:.0f}_{cy:.0f}"))
+
+        if placed:
+            # The click is on the rendered page; store it where the tags live.
+            px, py = from_view(ROT, pn, origin[0] + placed[0] / zoom,
+                               origin[1] + placed[1] / zoom)
+            st.session_state.pending = {"page": pn, "x": px, "y": py}
+            st.rerun(scope="fragment")
+
+        pending = st.session_state.get("pending")
+        if pending and pending["page"] == pn:
+            with st.form("place", clear_on_submit=True, border=False):
+                label_col, add_col, cancel_col = st.columns([2, 1, 1])
+                name = label_col.text_input(
+                    f"Name the tag at x={pending['x']:.0f}, y={pending['y']:.0f}",
+                    placeholder="MA1.2")
+                add_col.markdown("<br>", unsafe_allow_html=True)
+                cancel_col.markdown("<br>", unsafe_allow_html=True)
+                add = add_col.form_submit_button("Add  (Enter)", type="primary",
+                                                 use_container_width=True)
+                cancel = cancel_col.form_submit_button("Cancel", use_container_width=True)
+            if add and name.strip():
+                floor = next((t.get("floor_level") for t in on_page), "")
+                st.session_state[store] = tags + [
+                    new_tag(pn, pending["x"], pending["y"], name.strip(), floor)]
+                st.session_state.pending = None
+                st.rerun()
+            if cancel:
+                st.session_state.pending = None
+                st.rerun(scope="fragment")
+
+        with st.expander(f"The {len(on_page)} tag(s) on page {pn}"):
+            for tag in on_page:
+                row, button = st.columns([5, 1])
+                row.write(f"`{label_of(tag)}` · x={float(tag['x']):.0f}, "
+                          f"y={float(tag['y']):.0f} · {tag.get('source')}")
+                if button.button("Delete", key=f"del_{store}_{tag['_i']}"):
+                    st.session_state[store] = [t for t in tags if t["_i"] != tag["_i"]]
+                    st.rerun()
+
+    viewer()
+
+# ----------------------------------------------------------------- 4. unit labels
+st.subheader("4. Unit labels on the unit-plan sheets")
+st.caption("The name under each enlarged unit plan — “UNIT MI0.1”, “UNIT MI0.2” — found by the "
+           "scale line printed beneath it. These get the same markup and their own Units tab.")
+
+suggested = unit_label_pages(file_hash, pdf)
+default = st.session_state.get("unit_pages") or sorted(suggested)
+label_pages = st.multiselect(
+    "Unit-plan sheets", ALL, default=[p for p in default if p in ALL], format_func=page_label,
+    help="Suggested: " + (", ".join(f"page {p} ({n} plans)" for p, n in sorted(suggested.items()))
+                          or "none recognised"))
+
+if label_pages and st.button(f"Read unit labels from {len(label_pages)} page(s)"):
+    found = []
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        for pn in label_pages:
+            found += detect_unit_labels(doc[pn - 1], pn)
+    st.session_state.update(units=found, unit_pages=label_pages, units_cursor=0, tagged_pdf=None)
+    st.rerun()
+
+units = reindex("units")
+if units:
+    st.success(f"**{len(units)} unit labels** across {len({u['page'] for u in units})} sheet(s).")
+    st.caption("Same walkthrough as the floor-plan tags: Enter keeps the label and moves on, "
+               "the cross deletes a wrong one.")
+    walkthrough(store="units", cursor_key="units_cursor", word="Unit label")
+    with st.expander(f"All {len(units)} unit labels"):
+        st.dataframe(pd.DataFrame(sorted((label_of(u), u["page"]) for u in units),
+                                  columns=["Unit", "Page"]),
+                     hide_index=True, use_container_width=True, height=240)
+elif st.session_state.get("units") is not None:
+    st.warning("No unit labels were found on those sheets.")
+
+# ----------------------------------------------------------------- 5. match
+st.subheader("5. Put each floor tag under its unit plan")
+
+tags = st.session_state.tags
+units = st.session_state.get("units") or []
+summary = summarise(tags)
+merge_table: list[dict] | None = None
+
+if not units:
+    st.info("Read the unit labels in step 4 to group the counted floor tags under them.")
+else:
+    st.caption("The unit plan is the parent; one plan can carry several floor tags. A floor tag "
+               "starts under a plan only when the two names are exactly the same — nothing is "
+               "guessed. Drag the rest from the panel onto the plan they belong to; drag one "
+               "back to take it out. A tag you place by hand shows red.")
+    unit_cards, pool = parents(summary, [label_of(u) for u in units])
+    answer = matcher(units=unit_cards, pool=pool, key="matcher", default=None)
+    if answer:
+        st.session_state.match = answer
+
+    state = st.session_state.get("match") or {
+        "assigned": {u["unit"]: [k["tag"] for k in u["kids"]] for u in unit_cards},
+        "manual": [], "unassigned": [p["tag"] for p in pool]}
+    merge_table = merged_rows(summary, state.get("assigned", {}), state.get("manual", []))
+    unplaced = sum(dict(summary).get(t, 0) for t in state.get("unassigned", []))
+    st.caption(f"**{sum(q for _, q in summary) - unplaced} of {sum(q for _, q in summary)}** "
+               f"units placed under a plan · "
+               f"**{sum(1 for r in merge_table if r['manual'])}** floor tags placed by hand"
+               + (f" · **{unplaced} units still unplaced**" if unplaced else ""))
+
+# ----------------------------------------------------------------- 6. export
+st.subheader("6. Export")
+left, right = st.columns([2, 1])
+with left:
+    st.dataframe(pd.DataFrame(summary, columns=["Label", "Qty"]),
+                 hide_index=True, use_container_width=True, height=320)
+    st.caption(f"**{len(tags)} units**, {len(summary)} distinct labels."
+               + (f" Plus **{len(units)} unit labels** on the unit-plan sheets." if units else ""))
+with right:
     stem = Path(uploaded.name).stem
-    st.download_button("Download Excel", build_xlsx(named, result, plan_map),
-                       file_name=f"{stem}_UNIT_MATRIX.xlsx", type="primary",
+    sheet_numbers = {pn: (info.get("sheet") or "") for pn, info in sheets.items()}
+    st.download_button("Download Excel",
+                       build_xlsx(tags, units, merge_table, sheet_numbers), type="primary",
+                       file_name=f"{stem}_UNIT_MATRIX.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if st.button("Build tagged PDF"):
-        with st.spinner("Adding Bluebeam count markups…"):
-            st.session_state.tagged_pdf = build_pdf(pdf, named)
+        with st.spinner("Adding count markups…"):
+            st.session_state.tagged_pdf = build_pdf(pdf, tags, units)
     if st.session_state.get("tagged_pdf"):
         st.download_button("Download tagged PDF", st.session_state.tagged_pdf,
                            file_name=f"{stem}_tagged.pdf", mime="application/pdf")
-    st.caption("PDF tags are Polygon markups with subject FLOOR UNIT and contents “<unit>⏎1”, the same "
-               "as a manual Bluebeam count, so Bluebeam's markup summary gives the same totals.")
+    st.caption("Each markup is a red Polygon whose Subject is the tag name, so Bluebeam's "
+               "Markups List names every count instead of repeating “FLOOR UNIT”.")

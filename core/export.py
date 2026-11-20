@@ -8,153 +8,128 @@ import pymupdf as fitz
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
-# Bluebeam count markup, same shape as the manual takeoff (Polygon, subject FLOOR UNIT,
-# contents "<unit>\r1"), so Bluebeam's markup summary counts the exported tags too.
+# Bluebeam count markup. The annotation Subject carries the tag name itself, so the
+# Markups List identifies every tag instead of showing a generic "FLOOR UNIT" on every
+# row. Contents stay "<label>\r1" so Bluebeam's count summary still totals them.
 MARKUP_SIZE = 27.0
-MARKUP_SUBJECT = "FLOOR UNIT"
 MARKUP_AUTHOR = "Unit Matrix"
+UNNAMED = "?"
+# A floor tag the manager placed under a unit plan by hand, marked the same way on screen.
+MANUAL_FONT = Font(color="C62828", bold=True)
+
+
+def label_of(tag: dict[str, Any]) -> str:
+    """The reported name of a tag: its type code, else its unit number, else '?'."""
+    for key in ("unit", "unit_no"):
+        value = str(tag.get(key) or "").strip()
+        if value:
+            return value
+    return UNNAMED
 
 
 def summarise(tags: list[dict[str, Any]]) -> list[tuple[str, int]]:
-    counts = Counter(str(t["unit"]).strip() for t in tags if str(t.get("unit", "")).strip())
-    return sorted(counts.items(), key=lambda kv: kv[0])
+    return sorted(Counter(label_of(t) for t in tags).items(), key=lambda kv: kv[0])
 
 
 def _floor(tag: dict[str, Any]) -> str:
     return str(tag.get("floor_level") or "").strip() or "Not identified"
 
 
-def build_xlsx(tags: list[dict[str, Any]], comparison: dict[str, Any] | None = None,
-               unit_plans: dict[str, str] | None = None) -> bytes:
-    """UNIT_MATRIX (final table) / TO (pivot) / DATA (one row per tag), as in UNIT_MATRIX.xlsx,
-    plus UNIT FLOOR COUNT (unit x floor)."""
-    summary = summarise(tags)
+def build_xlsx(tags: list[dict[str, Any]], units: list[dict[str, Any]] | None = None,
+               merged: list[dict[str, Any]] | None = None,
+               sheet_of: dict[int, str] | None = None) -> bytes:
+    """Four tabs: Unit Tags, Floor Tags, Floor Tags by Level & Sheet, Merged.
+
+    `units` are the labels read off the unit-plan sheets, `merged` the grouped table from
+    the matcher, and `sheet_of` maps a page number to its sheet number for tab three.
+    """
     bold = Font(bold=True)
+    sheet_of = sheet_of or {}
     wb = Workbook()
+    written = []
 
-    ws = wb.active
-    ws.title = "UNIT_MATRIX"
-    ws.append(["UNIT", "Total"])
-    for unit, qty in summary:
-        ws.append([unit, qty])
-    ws.append(["Grand Total", f"=SUM(B2:B{len(summary) + 1})"])
-    for cell in (*ws[1], *ws[ws.max_row]):
-        cell.font = bold
+    # 1. the unit plans drawn on the unit-plan sheets
+    unit_tab = wb.active
+    unit_tab.title = "Unit Tags"
+    unit_tab.append(["Unit", "Count"])
+    unit_counts = Counter(label_of(u) for u in (units or []))
+    for name in sorted(unit_counts):
+        unit_tab.append([name, unit_counts[name]])
+    unit_tab.append(["Grand Total", sum(unit_counts.values())])
+    written.append(unit_tab)
 
-    to = wb.create_sheet("TO")
-    to.append(["Sum of QTY"])
-    to.append(["UNIT", "Total"])
-    for unit, qty in summary:
-        to.append([unit, qty])
-    to.append(["Grand Total", sum(q for _, q in summary)])
-    for cell in (*to[2], *to[to.max_row]):
-        cell.font = bold
+    # 2. the floor tags counted on the floor plans
+    floor_tab = wb.create_sheet("Floor Tags")
+    floor_tab.append(["Floor Tag", "Qty"])
+    summary = summarise(tags)
+    for label, qty in summary:
+        floor_tab.append([label, qty])
+    floor_tab.append(["Grand Total", sum(q for _, q in summary)])
+    written.append(floor_tab)
 
-    data = wb.create_sheet("DATA")
-    data.append(["UNIT", "QTY", "Count"])
-    for tag in sorted(tags, key=lambda t: (t["page"], t["y"], t["x"])):
-        if str(tag.get("unit", "")).strip():
-            data.append([str(tag["unit"]).strip(), 1, 1])
-    for cell in data[1]:
-        cell.font = bold
+    # 3. the same floor tags, broken out by the level and the sheet they were found on
+    detail = wb.create_sheet("Floor Tags by Level & Sheet")
+    detail.append(["Floor Tag", "Level", "Sheet", "Page", "Qty"])
+    rows = Counter((label_of(t), _floor(t), sheet_of.get(int(t["page"]), "") or "—",
+                    int(t["page"])) for t in tags)
+    for (label, floor, sheet, page), qty in sorted(rows.items()):
+        detail.append([label, floor, sheet, page, qty])
+    detail.append(["Grand Total", "", "", "", sum(rows.values())])
+    detail.column_dimensions["B"].width = 20
+    written.append(detail)
 
-    floors = wb.create_sheet("UNIT FLOOR COUNT")
-    floors.append(["UNIT", "Total", "FLOOR / LEVEL"])
-    named = [t for t in tags if str(t.get("unit", "")).strip()]
-    # Floors follow sheet order, so GROUND comes before SECOND and LEVEL 2 before LEVEL 10.
-    first_page: dict[str, int] = {}
-    for tag in named:
-        floor = _floor(tag)
-        first_page[floor] = min(first_page.get(floor, tag["page"]), tag["page"])
-    counts = Counter((str(t["unit"]).strip(), _floor(t)) for t in named)
-    for (unit, floor), qty in sorted(counts.items(), key=lambda kv: (kv[0][0], first_page[kv[0][1]])):
-        floors.append([unit, qty, floor])
-    floors.append(["Grand Total", f"=SUM(B2:B{len(counts) + 1})"])
-    for cell in (*floors[1], *floors[floors.max_row]):
-        cell.font = bold
-    floors.column_dimensions["C"].width = 22
+    # 4. the floor tags grouped under their unit plan
+    merge_tab = wb.create_sheet("Merged")
+    merge_tab.append(["Floor Tag", "Unit Plan", "Qty", "Merge Qty"])
+    for row in (merged or []):
+        merge_tab.append([row.get("tag", ""), row.get("unit", ""),
+                          row.get("qty", ""), row.get("merged", "")])
+        if row.get("manual"):
+            merge_tab.cell(row=merge_tab.max_row, column=1).font = MANUAL_FONT
+    # Merge the unit plan and its merged quantity down each group, as the manual takeoffs
+    # do: a group starts at a row that names a plan and runs to the row before the next one.
+    rows_out = list(merged or [])
+    starts = [i for i, row in enumerate(rows_out) if str(row.get("unit") or "")]
+    for position, start in enumerate(starts):
+        end = starts[position + 1] - 1 if position + 1 < len(starts) else len(rows_out) - 1
+        if end > start:
+            for column in ("B", "D"):
+                merge_tab.merge_cells(f"{column}{start + 2}:{column}{end + 2}")
+    centre = Alignment(vertical="center")
+    for row in merge_tab.iter_rows(min_row=2, max_row=merge_tab.max_row):
+        for cell in row:
+            cell.alignment = centre
 
-    if unit_plans is not None:
-        _unit_plan_sheet(wb, summary, unit_plans, bold)
+    merge_tab.append(["Grand Total", "",
+                      sum(r["qty"] for r in rows_out if isinstance(r.get("qty"), int)),
+                      sum(r["merged"] for r in rows_out if isinstance(r.get("merged"), int))])
+    written.append(merge_tab)
 
-    if comparison:
-        _comparison_sheets(wb, comparison, bold)
-
-    for sheet in (ws, to, data, floors):
-        sheet.column_dimensions["A"].width = 24
-        sheet.column_dimensions["B"].width = 12
+    for sheet in written:
+        for cell in (*sheet[1], *sheet[sheet.max_row]):
+            cell.font = bold
+        sheet.column_dimensions["A"].width = 22
+        sheet.freeze_panes = "A2"
+    for column in ("B", "C", "D"):
+        merge_tab.column_dimensions[column].width = 14
 
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
 
 
-def _unit_plan_sheet(wb, summary: list[tuple[str, int]], mapping: dict[str, str], bold) -> None:
-    """Label / UNIT PLAN / Total / MERG QTY, in the merged layout of the manual takeoffs."""
-    from .unitplans import merged_rows
-    rows = merged_rows(summary, mapping)
-    if not rows:
-        return
-    sheet = wb.create_sheet("UNIT PLAN MATRIX")
-    columns = ["Label", "UNIT PLAN", "Total", "MERG QTY"]
-    sheet.append(columns)
-    for row in rows:
-        sheet.append([row[c] for c in columns])
-    sheet.append(["GRAND TOTAL OF UNITS", "",
-                  sum(r["Total"] for r in rows),
-                  sum(r["MERG QTY"] for r in rows if r["MERG QTY"] != "")])
-    for cell in (*sheet[1], *sheet[sheet.max_row]):
-        cell.font = bold
+def build_pdf(pdf_bytes: bytes, tags: list[dict[str, Any]],
+              units: list[dict[str, Any]] | None = None) -> bytes:
+    """A red Polygon count markup on every tag, its Subject set to the tag name.
 
-    # Merge the unit plan and its merged quantity down the group, as the manual takeoffs
-    # do: a group starts at a row that carries a MERG QTY and runs to the next one.
-    starts = [i for i, row in enumerate(rows) if row["MERG QTY"] != ""]
-    for position, start in enumerate(starts):
-        end = starts[position + 1] - 1 if position + 1 < len(starts) else len(rows) - 1
-        if end > start:
-            for column in ("B", "D"):
-                sheet.merge_cells(f"{column}{start + 2}:{column}{end + 2}")
-    centre = Alignment(vertical="center")
-    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, min_col=2, max_col=4):
-        for cell in row:
-            cell.alignment = centre
-
-    for column, width in zip("ABCD", (22, 14, 10, 12)):
-        sheet.column_dimensions[column].width = width
-    sheet.freeze_panes = "A2"
-
-
-def _comparison_sheets(wb, comparison: dict[str, Any], bold) -> None:
-    """Our count against the architect's table: by unit type, and by unit x level."""
-    for title, rows, columns in (
-        ("COMPARISON", comparison.get("by_unit", []),
-         ["UNIT", "ARCHITECT", "COUNTED", "VARIANCE", "CHECK"]),
-        ("COMPARISON BY LEVEL", comparison.get("by_level", []),
-         ["UNIT", "LEVEL", "ARCHITECT", "COUNTED", "VARIANCE", "CHECK"]),
-    ):
-        if not rows:
-            continue
-        sheet = wb.create_sheet(title)
-        sheet.append(columns)
-        for row in rows:
-            sheet.append([row.get(c, "") for c in columns])
-        sheet.append(["TOTAL"] + [""] * (len(columns) - 5)
-                     + [comparison.get("architect_total", 0), comparison.get("counted_total", 0),
-                        comparison.get("counted_total", 0) - comparison.get("architect_total", 0), ""])
-        for cell in (*sheet[1], *sheet[sheet.max_row]):
-            cell.font = bold
-        for column, width in zip("ABCDEF", (24, 14, 14, 14, 12, 12)):
-            sheet.column_dimensions[column].width = width
-        sheet.freeze_panes = "A2"
-
-
-def build_pdf(pdf_bytes: bytes, tags: list[dict[str, Any]]) -> bytes:
+    The unit labels from the unit-plan sheets get the same markup, on their drawing title.
+    """
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        for tag in tags:
-            unit = str(tag.get("unit", "")).strip()
+        for tag in list(tags) + list(units or []):
             page_number = int(tag["page"])
-            if not unit or not 1 <= page_number <= len(doc):
+            if not 1 <= page_number <= len(doc):
                 continue
+            name = label_of(tag)
             page = doc[page_number - 1]
             cx = float(tag["x"]) + float(tag["w"]) / 2
             cy = float(tag["y"]) + float(tag["h"]) / 2
@@ -166,6 +141,6 @@ def build_pdf(pdf_bytes: bytes, tags: list[dict[str, Any]]) -> bytes:
             annot = page.add_polygon_annot(points)
             annot.set_colors(stroke=(1, 0, 0))
             annot.set_border(width=1.5)
-            annot.set_info(title=MARKUP_AUTHOR, subject=MARKUP_SUBJECT, content=f"{unit}\r1")
+            annot.set_info(title=MARKUP_AUTHOR, subject=name, content=f"{name}\r1")
             annot.update()
         return doc.tobytes(garbage=3, deflate=True)
