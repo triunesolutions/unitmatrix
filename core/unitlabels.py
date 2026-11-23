@@ -58,6 +58,8 @@ def detect_unit_labels(page: fitz.Page, page_number: int) -> list[dict[str, Any]
                      and abs(s["bbox"].x0 - box.x0) <= SCALE_DX for s in scales)
         found.append({
             "page": page_number, "unit": _name(match.group(1), match.group(2)),
+            "original_unit": _name(match.group(1), match.group(2)),
+            "tag_id": f"{page_number}:{round(box.x0, 1)}:{round(box.y0, 1)}:{round(box.width, 1)}:{round(box.height, 1)}",
             "unit_no": "", "matched_text": line["text"].strip(),
             "x": round(box.x0, 1), "y": round(box.y0, 1),
             "w": round(box.width, 1), "h": round(box.height, 1),

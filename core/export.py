@@ -8,6 +8,8 @@ import pymupdf as fitz
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
+from .sorting import natural_key
+
 # Bluebeam count markup. The annotation Subject carries the tag name itself, so the
 # Markups List identifies every tag instead of showing a generic "FLOOR UNIT" on every
 # row. Contents stay "<label>\r1" so Bluebeam's count summary still totals them.
@@ -28,7 +30,7 @@ def label_of(tag: dict[str, Any]) -> str:
 
 
 def summarise(tags: list[dict[str, Any]]) -> list[tuple[str, int]]:
-    return sorted(Counter(label_of(t) for t in tags).items(), key=lambda kv: kv[0])
+    return sorted(Counter(label_of(t) for t in tags).items(), key=lambda kv: natural_key(kv[0]))
 
 
 def _floor(tag: dict[str, Any]) -> str:
@@ -37,7 +39,9 @@ def _floor(tag: dict[str, Any]) -> str:
 
 def build_xlsx(tags: list[dict[str, Any]], units: list[dict[str, Any]] | None = None,
                merged: list[dict[str, Any]] | None = None,
-               sheet_of: dict[int, str] | None = None) -> bytes:
+               sheet_of: dict[int, str] | None = None,
+               floor_summary: list[tuple[str, int]] | None = None,
+               unit_summary: list[tuple[str, int]] | None = None) -> bytes:
     """Four tabs: Unit Tags, Floor Tags, Floor Tags by Level & Sheet, Merged.
 
     `units` are the labels read off the unit-plan sheets, `merged` the grouped table from
@@ -52,8 +56,9 @@ def build_xlsx(tags: list[dict[str, Any]], units: list[dict[str, Any]] | None = 
     unit_tab = wb.active
     unit_tab.title = "Unit Tags"
     unit_tab.append(["Unit", "Count"])
-    unit_counts = Counter(label_of(u) for u in (units or []))
-    for name in sorted(unit_counts):
+    unit_counts = (Counter(dict(unit_summary)) if unit_summary is not None
+                   else Counter(label_of(u) for u in (units or [])))
+    for name in sorted(unit_counts, key=natural_key):
         unit_tab.append([name, unit_counts[name]])
     unit_tab.append(["Grand Total", sum(unit_counts.values())])
     written.append(unit_tab)
@@ -61,7 +66,8 @@ def build_xlsx(tags: list[dict[str, Any]], units: list[dict[str, Any]] | None = 
     # 2. the floor tags counted on the floor plans
     floor_tab = wb.create_sheet("Floor Tags")
     floor_tab.append(["Floor Tag", "Qty"])
-    summary = summarise(tags)
+    summary = floor_summary if floor_summary is not None else summarise(tags)
+    summary = sorted(summary, key=lambda item: natural_key(item[0]))
     for label, qty in summary:
         floor_tab.append([label, qty])
     floor_tab.append(["Grand Total", sum(q for _, q in summary)])
@@ -72,7 +78,10 @@ def build_xlsx(tags: list[dict[str, Any]], units: list[dict[str, Any]] | None = 
     detail.append(["Floor Tag", "Level", "Sheet", "Page", "Qty"])
     rows = Counter((label_of(t), _floor(t), sheet_of.get(int(t["page"]), "") or "—",
                     int(t["page"])) for t in tags)
-    for (label, floor, sheet, page), qty in sorted(rows.items()):
+    for (label, floor, sheet, page), qty in sorted(
+            rows.items(), key=lambda item: (natural_key(item[0][0]),
+                                            natural_key(item[0][1]),
+                                            natural_key(item[0][2]), item[0][3])):
         detail.append([label, floor, sheet, page, qty])
     detail.append(["Grand Total", "", "", "", sum(rows.values())])
     detail.column_dimensions["B"].width = 20

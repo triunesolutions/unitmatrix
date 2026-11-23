@@ -2,121 +2,52 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Unit plan matcher</title>
+<title>Unit plan matching table</title>
 <style>
-  :root {
-    --ink: #11181f;
-    --muted: #64748b;
-    --line: #d9e0e8;
-    --panel: #f6f8fa;
-    --card: #ffffff;
-    --chip: #e8eef6;
-    --chip-ink: #214f7d;
-    --manual: #c62828;
-    --manual-bg: #fdeaea;
-    --drop: #cfe6ff;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --ink: #e8edf2; --muted: #93a1b1; --line: #33414f; --panel: #1b2430; --card: #141c26;
-      --chip: #263546; --chip-ink: #9ec5f0; --manual: #ff7b72; --manual-bg: #3a1f1f;
-      --drop: #2b4a6b;
-    }
-  }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; color: var(--ink); background: transparent;
-    font: 14px/1.45 "Source Sans Pro", -apple-system, Segoe UI, Roboto, sans-serif;
+  body { margin: 0; color: #000; background: #fff; font: 12px/1.2 Arial, sans-serif; }
+  .table-wrap { max-height: 520px; overflow: auto; border: 1px solid #000; border-bottom: 0; background: #fff; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  .total-table { border: 1px solid #000; }
+  col.floor { width: 34.375%; }
+  col.plan { width: 21.875%; }
+  col.qty { width: 21.875%; }
+  col.merge { width: 21.875%; }
+  th, td { border: 1px solid #000; padding: 3px 6px; height: 22px; }
+  th { position: sticky; top: 0; z-index: 2; background: #fff; font-weight: 700; text-align: left; }
+  td.qty, td.merge, td.total { text-align: right; font-variant-numeric: tabular-nums; }
+  td.group-plan, td.group-merge { vertical-align: middle; }
+  td.manual { color: #c62828; font-weight: 700; }
+  .edit-group { position: relative; }
+  .edit-group summary { cursor: pointer; list-style: none; }
+  .edit-group summary::-webkit-details-marker { display: none; }
+  .edit-group summary::after { content: "Edit"; float: right; margin-left: 6px; color: #333; text-decoration: underline; }
+  .edit-popover {
+    position: absolute; top: 19px; left: -2px; z-index: 5; width: 250px; max-height: 260px;
+    overflow: auto; padding: 6px; border: 1px solid #000; background: #fff;
+    box-shadow: 0 2px 6px #0003;
   }
-  .bar {
-    display: flex; gap: 14px; align-items: center; margin-bottom: 10px;
-    font-size: 12px; color: var(--muted); flex-wrap: wrap;
-  }
-  .bar b { color: var(--ink); }
-  .bar .warn { color: var(--manual); font-weight: 600; }
-  button {
-    font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px;
-    border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer;
-  }
-  .wrap { display: flex; gap: 18px; align-items: flex-start; }
-  .left { flex: 1 1 auto; min-width: 0; }
-  .right { flex: 0 0 250px; position: sticky; top: 0; }
-  .scroll { max-height: 620px; overflow: auto; padding-right: 4px; }
-
-  .card {
-    border: 1px solid var(--line); border-radius: 8px; background: var(--card);
-    margin-bottom: 8px; padding: 8px 10px;
-  }
-  .card.over { border-color: var(--chip-ink); background: var(--drop); }
-  .card.bare { border-style: dashed; }
-  .card-head {
-    display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;
-  }
-  .unit { font-weight: 700; font-size: 15px; }
-  .total {
-    margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700;
-    font-size: 15px;
-  }
-  .total small { font-weight: 400; color: var(--muted); font-size: 11px; }
-  .kids { display: flex; flex-wrap: wrap; gap: 6px; min-height: 26px; align-items: center; }
-
-  .chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 3px 9px; border-radius: 6px;
-    background: var(--chip); color: var(--chip-ink); font-weight: 600;
-    cursor: grab; user-select: none; white-space: nowrap;
-  }
-  /* The quantity sits in its own solid badge: as a faded inline number it was unreadable
-     against the chip, and unreadable again in the red hand-placed state. */
-  .chip .q {
-    font-size: 11px; font-weight: 700; line-height: 1.5;
-    padding: 0 5px; border-radius: 4px;
-    background: var(--chip-ink); color: var(--card);
-    font-variant-numeric: tabular-nums;
-  }
-  .chip.manual { color: var(--manual); background: var(--manual-bg); }
-  .chip.manual .q { background: var(--manual); color: #ffffff; }
-  .chip.dragging { opacity: .4; }
-  .empty { color: var(--muted); font-style: italic; font-size: 12px; }
-
-  .panel {
-    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
-    padding: 10px; min-height: 140px;
-  }
-  .panel.over { border-color: var(--chip-ink); background: var(--drop); }
-  .panel h3 {
-    margin: 0 0 4px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase;
-    color: var(--muted); font-weight: 600;
-  }
-  .panel p { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
-  .pool { display: flex; flex-wrap: wrap; gap: 6px; }
-  @media (max-width: 760px) {
-    .wrap { flex-direction: column; } .right { flex: 1 1 auto; width: 100%; position: static; }
-  }
+  .edit-row { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(110px, 1.2fr); gap: 6px; align-items: center; padding: 3px 0; }
+  .edit-row select { width: 100%; min-width: 0; }
+  select { padding: 2px; border: 1px solid #777; color: #000; background: #fff; font: inherit; }
+  tr.grand-total td { font-weight: 700; border-top: 2px solid #000; border-bottom: 2px solid #000; }
 </style>
 </head>
 <body>
-<div class="bar">
-  <span><b id="n-placed">0</b> of <b id="n-tags">0</b> floor tags placed</span>
-  <span><b id="n-qty">0</b> units counted</span>
-  <span class="warn" id="warn"></span>
-  <button id="reset" type="button">Reset to exact matches</button>
+<div class="table-wrap">
+  <table aria-label="Unit plan matching">
+    <colgroup><col class="floor"><col class="plan"><col class="qty"><col class="merge"></colgroup>
+    <thead><tr><th>Floor Tag</th><th>Unit Plan</th><th>Qty</th><th>Merge Qty</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
 </div>
-<div class="wrap">
-  <div class="left scroll" id="cards"></div>
-  <div class="right">
-    <div class="panel" id="pool-panel">
-      <h3>Floor tags not yet placed</h3>
-      <p>Drag a floor tag onto the unit it belongs to. Drag it back here to take it out.
-         A tag you place by hand shows red.</p>
-      <div class="pool" id="pool"></div>
-    </div>
-  </div>
-</div>
+<table class="total-table" aria-label="Matching totals">
+  <colgroup><col class="floor"><col class="plan"><col class="qty"><col class="merge"></colgroup>
+  <tbody id="grand-total"></tbody>
+</table>
 <script>
 "use strict";
 
-// Streamlit's component protocol, written out by hand so this needs no npm build.
 function post(message) {
   window.parent.postMessage(Object.assign({isStreamlitMessage: true}, message), "*");
 }
@@ -127,177 +58,207 @@ function setValue(value) {
   post({type: "streamlit:setComponentValue", dataType: "json", value: value});
 }
 
-// STATE = {units: [{unit, kids: [{tag, qty, manual}]}], pool: [{tag, qty}]}
-let STATE = null;
-let INITIAL = null;
-let dragging = null;
+const UNASSIGNED = "__UNIT_MATRIX_UNASSIGNED__";
+let RECORDS = [];
+let PLANS = [];
+let UNASSIGNED_LABEL = "(not placed)";
+let GRAND_TOTAL = {qty: 0, merged: 0};
+let SIGNATURE = null;
 
-function clone(value) { return JSON.parse(JSON.stringify(value)); }
+function normalise(value) { return String(value || "").trim().toUpperCase(); }
+const NATURAL = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
 
-function chip(entry, from) {
-  const el = document.createElement("span");
-  el.className = "chip" + (entry.manual ? " manual" : "");
-  el.draggable = true;
-  el.title = entry.manual ? "Placed by hand" : "Exact name match";
-  const name = document.createElement("span");
-  name.textContent = entry.tag;
-  const qty = document.createElement("span");
-  qty.className = "q";
-  qty.textContent = entry.qty;
-  el.append(name, qty);
-  el.addEventListener("dragstart", (event) => {
-    dragging = {tag: entry.tag, from: from};
-    el.classList.add("dragging");
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", entry.tag);
-  });
-  el.addEventListener("dragend", () => {
-    dragging = null;
-    el.classList.remove("dragging");
-  });
-  return el;
-}
-
-function take(tag, from) {
-  if (from === "pool") {
-    const at = STATE.pool.findIndex((p) => p.tag === tag);
-    return at < 0 ? null : STATE.pool.splice(at, 1)[0];
+function loadRows(rows) {
+  const records = [];
+  let currentUnit = UNASSIGNED;
+  for (const row of rows || []) {
+    if (row.unit) {
+      currentUnit = row.unit === UNASSIGNED_LABEL ? UNASSIGNED : row.unit;
+    }
+    if (row.tag) {
+      records.push({
+        tag: row.tag,
+        unit: currentUnit,
+        qty: row.qty,
+        manual: Boolean(row.manual),
+      });
+    } else if (row.unit) {
+      // Keep an otherwise unused plan visible, as the Excel Merged sheet does.
+      records.push({tag: "", unit: currentUnit, qty: "", manual: false});
+    }
   }
-  const parent = STATE.units.find((u) => u.unit === from);
-  if (!parent) return null;
-  const at = parent.kids.findIndex((k) => k.tag === tag);
-  return at < 0 ? null : parent.kids.splice(at, 1)[0];
+  return records;
 }
 
-function dropOnUnit(unit) {
-  if (!dragging || dragging.from === unit) return;
-  const parent = STATE.units.find((u) => u.unit === unit);
-  const moved = take(dragging.tag, dragging.from);
-  if (!parent || !moved) return;
-  moved.manual = true;              // anything the manager placed is a manual resolution
-  parent.kids.push(moved);
-  parent.kids.sort((a, b) => a.tag.localeCompare(b.tag));
-  render();
-}
-
-function dropOnPool() {
-  if (!dragging || dragging.from === "pool") return;
-  const moved = take(dragging.tag, dragging.from);
-  if (moved) {
-    STATE.pool.push({tag: moved.tag, qty: moved.qty});
-    render();
+function groupedRows() {
+  const groups = new Map();
+  for (const plan of PLANS) groups.set(plan, {unit: plan, tags: []});
+  for (const record of RECORDS) {
+    if (!record.tag) continue;
+    const key = record.unit || UNASSIGNED;
+    if (!groups.has(key)) groups.set(key, {unit: key, tags: []});
+    groups.get(key).tags.push(record);
   }
+  const list = [...groups.values()];
+  for (const group of list) {
+    group.tags.sort((a, b) => NATURAL.compare(a.tag, b.tag));
+    group.sortKey = group.tags.length ? normalise(group.tags[0].tag) : "\uffff" + normalise(group.unit);
+    group.mergeQty = group.tags.reduce((sum, record) => sum + (Number(record.qty) || 0), 0);
+  }
+  return list.sort((a, b) => NATURAL.compare(a.sortKey, b.sortKey) ||
+    NATURAL.compare(a.unit, b.unit));
 }
 
-function dropTarget(element, onDrop) {
-  element.addEventListener("dragover", (event) => {
-    if (!dragging) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-    element.classList.add("over");
-  });
-  element.addEventListener("dragleave", () => element.classList.remove("over"));
-  element.addEventListener("drop", (event) => {
-    event.preventDefault();
-    element.classList.remove("over");
-    onDrop();
-  });
+function publish() {
+  const assigned = Object.fromEntries(PLANS.map((plan) => [plan, []]));
+  const manual = [];
+  const unassigned = [];
+  for (const record of RECORDS) {
+    if (!record.tag) continue;
+    if (record.unit === UNASSIGNED) {
+      unassigned.push(record.tag);
+    } else {
+      assigned[record.unit] = assigned[record.unit] || [];
+      assigned[record.unit].push(record.tag);
+      if (record.manual) manual.push(record.tag);
+    }
+  }
+  setValue({assigned: assigned, manual: manual, unassigned: unassigned});
+}
+
+function editor(group) {
+  const details = document.createElement("details");
+  details.className = "edit-group";
+  const summary = document.createElement("summary");
+  summary.textContent = group.unit === UNASSIGNED ? UNASSIGNED_LABEL : group.unit;
+  details.appendChild(summary);
+
+  const panel = document.createElement("div");
+  panel.className = "edit-popover";
+  for (const record of group.tags) {
+    const line = document.createElement("label");
+    line.className = "edit-row";
+    const name = document.createElement("span");
+    name.textContent = record.tag;
+    if (record.manual) name.className = "manual";
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", `Unit Plan for ${record.tag}`);
+    const none = document.createElement("option");
+    none.value = UNASSIGNED;
+    none.textContent = UNASSIGNED_LABEL;
+    select.appendChild(none);
+    for (const plan of PLANS) {
+      const option = document.createElement("option");
+      option.value = plan;
+      option.textContent = plan;
+      select.appendChild(option);
+    }
+    select.value = record.unit || UNASSIGNED;
+    select.addEventListener("change", () => {
+      if (select.value === record.unit) return;
+      record.unit = select.value;
+      // Like a drag assignment, moving a tag to a plan is manual; returning it to the
+      // unassigned pool clears the manual flag.
+      record.manual = select.value !== UNASSIGNED;
+      render();
+      publish();
+    });
+    line.append(name, select);
+    panel.appendChild(line);
+  }
+  details.appendChild(panel);
+  return details;
 }
 
 function render() {
-  const host = document.getElementById("cards");
-  host.textContent = "";
-  for (const parent of STATE.units) {
-    const total = parent.kids.reduce((sum, k) => sum + k.qty, 0);
-    const card = document.createElement("div");
-    card.className = "card" + (parent.kids.length ? "" : " bare");
-
-    const head = document.createElement("div");
-    head.className = "card-head";
-    const name = document.createElement("span");
-    name.className = "unit";
-    name.textContent = parent.unit;
-    const sum = document.createElement("span");
-    sum.className = "total";
-    sum.textContent = total;
-    const note = document.createElement("small");
-    note.textContent = total === 1 ? " unit" : " units";
-    sum.appendChild(note);
-    head.append(name, sum);
-    card.appendChild(head);
-
-    const kids = document.createElement("div");
-    kids.className = "kids";
-    if (parent.kids.length) {
-      for (const kid of parent.kids) kids.appendChild(chip(kid, parent.unit));
-    } else {
-      const hint = document.createElement("span");
-      hint.className = "empty";
-      hint.textContent = "drop the floor tags that use this unit plan";
-      kids.appendChild(hint);
+  const body = document.getElementById("rows");
+  body.textContent = "";
+  const groups = groupedRows();
+  GRAND_TOTAL = {
+    qty: RECORDS.reduce((sum, record) => sum + (Number(record.qty) || 0), 0),
+    merged: groups.reduce((sum, group) => sum + (Number(group.mergeQty) || 0), 0),
+  };
+  for (const group of groups) {
+    if (!group.tags.length) {
+      const tr = document.createElement("tr");
+      const floor = document.createElement("td");
+      const plan = document.createElement("td");
+      plan.className = "group-plan";
+      plan.textContent = group.unit;
+      const qty = document.createElement("td");
+      qty.className = "qty";
+      const merged = document.createElement("td");
+      merged.className = "group-merge merge";
+      merged.textContent = "0";
+      tr.append(floor, plan, qty, merged);
+      body.appendChild(tr);
+      continue;
     }
-    card.appendChild(kids);
-    dropTarget(card, () => dropOnUnit(parent.unit));
-    host.appendChild(card);
+
+    group.tags.forEach((record, index) => {
+      const tr = document.createElement("tr");
+      const floor = document.createElement("td");
+      floor.textContent = record.tag;
+      if (record.manual) floor.className = "manual";
+      tr.appendChild(floor);
+
+      if (index === 0) {
+        const plan = document.createElement("td");
+        plan.className = "group-plan";
+        plan.rowSpan = group.tags.length;
+        plan.appendChild(editor(group));
+        tr.appendChild(plan);
+      }
+
+      const qty = document.createElement("td");
+      qty.className = "qty";
+      qty.textContent = record.qty;
+      tr.appendChild(qty);
+
+      if (index === 0) {
+        const merged = document.createElement("td");
+        merged.className = "group-merge merge";
+        merged.rowSpan = group.tags.length;
+        merged.textContent = group.mergeQty;
+        tr.appendChild(merged);
+      }
+      body.appendChild(tr);
+    });
   }
 
-  const pool = document.getElementById("pool");
-  pool.textContent = "";
-  STATE.pool.sort((a, b) => a.tag.localeCompare(b.tag));
-  for (const entry of STATE.pool) pool.appendChild(chip(entry, "pool"));
-  if (!STATE.pool.length) {
-    const done = document.createElement("span");
-    done.className = "empty";
-    done.textContent = "every floor tag is placed";
-    pool.appendChild(done);
-  }
-
-  const placed = STATE.units.reduce((n, u) => n + u.kids.length, 0);
-  const counted = STATE.units.reduce(
-    (n, u) => n + u.kids.reduce((s, k) => s + k.qty, 0), 0);
-  const left = STATE.pool.reduce((s, p) => s + p.qty, 0);
-  document.getElementById("n-placed").textContent = placed;
-  document.getElementById("n-tags").textContent = placed + STATE.pool.length;
-  document.getElementById("n-qty").textContent = counted;
-  document.getElementById("warn").textContent =
-    left ? left + " units still unplaced" : "";
-
-  setValue({
-    assigned: STATE.units.reduce((out, u) => {
-      out[u.unit] = u.kids.map((k) => k.tag);
-      return out;
-    }, {}),
-    manual: STATE.units.flatMap((u) => u.kids.filter((k) => k.manual).map((k) => k.tag)),
-    unassigned: STATE.pool.map((p) => p.tag),
-  });
-  setHeight(Math.max(document.body.scrollHeight + 8, 260));
+  const totalBody = document.getElementById("grand-total");
+  totalBody.textContent = "";
+  const total = document.createElement("tr");
+  total.className = "grand-total";
+  const totalLabel = document.createElement("td");
+  totalLabel.textContent = "Grand Total";
+  const totalUnit = document.createElement("td");
+  const totalQty = document.createElement("td");
+  totalQty.className = "total";
+  totalQty.textContent = GRAND_TOTAL.qty;
+  const totalMerged = document.createElement("td");
+  totalMerged.className = "total";
+  totalMerged.textContent = GRAND_TOTAL.merged;
+  total.append(totalLabel, totalUnit, totalQty, totalMerged);
+  totalBody.appendChild(total);
+  setHeight(Math.min(Math.max(document.body.scrollHeight + 8, 120), 580));
 }
-
-dropTarget(document.getElementById("pool-panel"), dropOnPool);
-document.getElementById("reset").addEventListener("click", () => {
-  STATE = clone(INITIAL);
-  render();
-});
 
 window.addEventListener("message", (event) => {
   if (!event.data || event.data.type !== "streamlit:render") return;
   const args = event.data.args || {};
-  const signature = JSON.stringify([args.units, args.pool]);
-  if (signature === window.__signature) return;   // a rerun with the same input: keep edits
-  window.__signature = signature;
-  INITIAL = {
-    units: (args.units || []).map((u) => ({
-      unit: u.unit,
-      kids: (u.kids || []).map((k) => ({tag: k.tag, qty: k.qty, manual: false})),
-    })),
-    pool: (args.pool || []).map((p) => ({tag: p.tag, qty: p.qty})),
-  };
-  STATE = clone(INITIAL);
+  const signature = JSON.stringify([args.rows, args.plans, args.unassigned_label, args.grand_total]);
+  if (signature === SIGNATURE) return;
+  SIGNATURE = signature;
+  PLANS = args.plans || [];
+  UNASSIGNED_LABEL = args.unassigned_label || UNASSIGNED_LABEL;
+  GRAND_TOTAL = args.grand_total || GRAND_TOTAL;
+  RECORDS = loadRows(args.rows);
   render();
 });
 
 post({type: "streamlit:componentReady", apiVersion: 1});
-setHeight(280);
+setHeight(160);
 </script>
 </body>
 </html>

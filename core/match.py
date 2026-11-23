@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .sorting import natural_key
+
 UNASSIGNED = "(not placed)"
 
 
@@ -26,14 +28,15 @@ def parents(summary: list[tuple[str, int]],
     names = {normalise(t): t for t, _ in summary}
     units = []
     claimed: set[str] = set()
-    for plan in sorted(set(plans), key=normalise):
+    for plan in sorted(set(plans), key=natural_key):
         key = normalise(plan)
         kids = []
         if key in qty and key not in claimed:
             claimed.add(key)
             kids.append({"tag": names[key], "qty": qty[key]})
         units.append({"unit": plan, "kids": kids})
-    pool = [{"tag": names[k], "qty": qty[k]} for k in sorted(qty) if k not in claimed]
+    pool = [{"tag": names[k], "qty": qty[k]} for k in sorted(
+        qty, key=lambda key: natural_key(names.get(key, key))) if k not in claimed]
     return units, pool
 
 
@@ -56,16 +59,19 @@ def merged_rows(summary: list[tuple[str, int]], assigned: dict[str, list[str]],
     groups = []
     placed: set[str] = set()
     for plan, tags in assigned.items():
-        keys = sorted({normalise(t) for t in tags if normalise(t) in qty})
+        keys = sorted({normalise(t) for t in tags if normalise(t) in qty},
+                      key=lambda key: natural_key(names.get(key, key)))
         placed.update(keys)
         groups.append((keys[0] if keys else "￿" + normalise(plan), plan, keys))
 
-    left = sorted(k for k in qty if k not in placed)
+    left = sorted((k for k in qty if k not in placed),
+                  key=lambda key: natural_key(names.get(key, key)))
     if left:
         groups.append((left[0], UNASSIGNED, left))
 
     rows: list[dict[str, Any]] = []
-    for _, plan, keys in sorted(groups):
+    for _, plan, keys in sorted(groups, key=lambda group: (
+            natural_key(names.get(group[0], group[0])), natural_key(group[1]))):
         if not keys:
             rows.append({"tag": "", "unit": plan, "qty": "", "merged": 0, "manual": False})
             continue
@@ -79,3 +85,13 @@ def merged_rows(summary: list[tuple[str, int]], assigned: dict[str, list[str]],
                 "manual": key in by_hand,
             })
     return rows
+
+
+def matching_totals(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Totals for the numeric Qty and Merge Qty cells displayed by the matcher."""
+    return {
+        "qty": sum(value for row in rows
+                   if isinstance((value := row.get("qty")), int) and not isinstance(value, bool)),
+        "merged": sum(value for row in rows
+                      if isinstance((value := row.get("merged")), int) and not isinstance(value, bool)),
+    }

@@ -271,7 +271,9 @@ def _dedupe_positions(tags: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _tag(page_number: int, name: str, line: dict[str, Any], unit_no: str = "") -> dict[str, Any]:
     r = line["bbox"]
     return {
-        "page": page_number, "unit": name, "unit_no": unit_no, "matched_text": line["text"],
+        "page": page_number, "unit": name, "original_unit": name,
+        "tag_id": f"{page_number}:{round(r.x0, 1)}:{round(r.y0, 1)}:{round(r.width, 1)}:{round(r.height, 1)}",
+        "unit_no": unit_no, "matched_text": line["text"],
         "x": round(r.x0, 1), "y": round(r.y0, 1), "w": round(r.width, 1), "h": round(r.height, 1),
         "source": line["source"],
     }

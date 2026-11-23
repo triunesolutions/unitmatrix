@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -22,8 +23,11 @@ import streamlit.components.v1 as components
 
 from core.detect import detect_unit_tags, detect_unit_types, page_title
 from core.export import build_pdf, build_xlsx, label_of, summarise
-from core.match import merged_rows, parents
+from core.match import UNASSIGNED, matching_totals, merged_rows, normalise, parents
 from core.sheets import sheet_index
+from core.summary import (build_summary, group_id, natural_key, summary_pairs,
+                          summary_totals)
+from core.tagrename import normalised_original, propagate_rename
 from core.unitlabels import detect_unit_labels, suggest_unit_label_pages
 
 # Drag-and-drop matcher. A plain HTML/JS component served from the project, so it needs
@@ -159,8 +163,85 @@ def draw_tags(image: Image.Image, tags: list[dict], zoom: float,
 def reindex(store: str = "tags") -> list[dict]:
     tags = st.session_state.get(store) or []
     for i, tag in enumerate(tags):
+        # Backward compatibility for records already present in a live session.
+        tag.setdefault("original_unit", str(tag.get("unit") or ""))
         tag["_i"] = i
     return tags
+
+
+def reconcile_match_rename(old_name: str, new_name: str, tags: list[dict]) -> None:
+    """Rebuild automatic matches and carry label-level manual placements safely."""
+    state = st.session_state.get("match")
+    if not state or not old_name or old_name == new_name:
+        return
+    labels = {normalise(label_of(item)) for item in tags}
+    old_key, new_key = normalise(old_name), normalise(new_name)
+    if new_key in labels - {old_key}:
+        st.session_state.match = None
+        st.session_state.match_warning = (
+            f"The rename to {new_name!r} joins an existing label. Matching was reset to "
+            "automatic exact-name assignments; please review manual placements.")
+        return
+    # Matcher state is label based. Recompute automatic exact-name placements, then
+    # carry only explicit manual placements across the label change.
+    plans = [label_of(item) for item in (st.session_state.get("units") or [])]
+    cards, pool = parents(summarise(tags), plans)
+    assigned = {card["unit"]: [kid["tag"] for kid in card["kids"]] for card in cards}
+    old_to_plan = {normalise(tag): plan for plan, values in state.get("assigned", {}).items()
+                   for tag in values}
+    manual_labels = [new_name if normalise(tag) == old_key else tag
+                     for tag in state.get("manual", [])]
+    valid = {normalise(label): label for label, _ in summarise(tags)}
+    for manual_label in manual_labels:
+        label = valid.get(normalise(manual_label))
+        plan = old_to_plan.get(old_key if normalise(manual_label) == new_key else normalise(manual_label))
+        if label and plan in assigned:
+            assigned[plan] = [t for t in assigned[plan] if normalise(t) != normalise(label)] + [label]
+    manually_placed = [valid[normalise(tag)] for tag in manual_labels
+                       if normalise(tag) in valid and old_to_plan.get(
+                           old_key if normalise(tag) == new_key else normalise(tag)) in assigned]
+    unassigned = [p["tag"] for p in pool
+                  if normalise(p["tag"]) not in {normalise(t) for vals in assigned.values() for t in vals}]
+    st.session_state.match = {"assigned": assigned, "manual": manually_placed,
+                              "unassigned": unassigned}
+    st.session_state.match_warning = None
+
+
+def reconcile_plan_rename(old_name: str, new_name: str, units: list[dict],
+                          current: dict) -> None:
+    """Refresh exact matches after a plan label changes; retain clear manual placements."""
+    state = st.session_state.get("match")
+    if not state or not old_name or old_name == new_name:
+        return
+    plans = [label_of(item) for item in units]
+    old_key, new_key = normalise(old_name), normalise(new_name)
+    group = normalised_original(current)
+    collision = any(normalise(label_of(item)) == new_key
+                    and normalised_original(item) != group for item in units)
+    if collision:
+        st.session_state.match = None
+        st.session_state.match_warning = (
+            f"The plan rename to {new_name!r} joins an existing plan label. Matching was "
+            "reset to automatic exact-name assignments; please review manual placements.")
+        return
+    tags = st.session_state.get("tags") or []
+    cards, pool = parents(summarise(tags), plans)
+    assigned = {card["unit"]: [kid["tag"] for kid in card["kids"]] for card in cards}
+    prior_plan = next((plan for plan in state.get("assigned", {})
+                       if normalise(plan) == old_key), None)
+    destination = next((plan for plan in assigned if normalise(plan) == new_key), None)
+    manual_tags = [tag for tag in state.get("manual", [])
+                   if prior_plan is not None and tag in state.get("assigned", {}).get(prior_plan, [])]
+    if destination:
+        for tag in manual_tags:
+            assigned[destination] = [t for t in assigned[destination] if normalise(t) != normalise(tag)] + [tag]
+    placed = {normalise(tag) for values in assigned.values() for tag in values}
+    st.session_state.match = {
+        "assigned": assigned,
+        "manual": [tag for tag in manual_tags if normalise(tag) in placed],
+        "unassigned": [item["tag"] for item in pool if normalise(item["tag"]) not in placed],
+    }
+    st.session_state.match_warning = None
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -170,9 +251,80 @@ def unit_label_pages(file_hash: str, _pdf: bytes) -> dict[int, int]:
 
 
 def new_tag(page: int, x: float, y: float, name: str, floor: str) -> dict:
-    return {"page": page, "unit": name, "unit_no": "", "matched_text": "added by hand",
+    return {"page": page, "unit": name, "original_unit": name,
+            "tag_id": uuid.uuid4().hex,
+            "unit_no": "", "matched_text": "added by hand",
             "x": x - TAG_BOX / 2, "y": y - TAG_BOX / 2, "w": TAG_BOX, "h": TAG_BOX,
             "source": "manual", "floor_level": floor}
+
+
+def editable_summary(records: list[dict], category: str,
+                     name_column: str, correction_state: str) -> list[dict]:
+    """Edit group names and corrected quantities without changing detections."""
+    corrections = st.session_state.setdefault(correction_state, {})
+    source_rows = build_summary(records, corrections, category)
+    active_ids = {row["Group ID"] for row in source_rows}
+    st.session_state[correction_state] = {
+        key: value for key, value in corrections.items() if key in active_ids}
+    corrections = st.session_state[correction_state]
+    frame = pd.DataFrame(source_rows, columns=["Group ID", "Name", "Detected Qty",
+                                               "Corrected Qty"]).rename(columns={"Name": name_column})
+    widget_key = f"summary_editor_{category}_{hashlib.md5('|'.join(sorted(active_ids)).encode()).hexdigest()[:10]}"
+    edited = st.data_editor(
+        frame, key=widget_key, hide_index=True, use_container_width=True,
+        column_order=[name_column, "Detected Qty", "Corrected Qty"],
+        column_config={
+            "Group ID": None,
+            name_column: st.column_config.TextColumn(name_column, required=True),
+            "Detected Qty": st.column_config.NumberColumn("Detected Qty", disabled=True),
+            "Corrected Qty": st.column_config.NumberColumn(
+                "Corrected Qty", min_value=0, step=1, required=True),
+        },
+    )
+    source_by_id = {row["Group ID"]: row for row in source_rows}
+    for row in edited.to_dict("records"):
+        identifier = row.get("Group ID")
+        old = source_by_id.get(identifier)
+        if old is None:
+            continue
+        name = str(row.get(name_column) or "").strip()
+        group = [record for record in records if group_id(record, category) == identifier]
+        if name != old["Name"] and group:
+            prior_name = label_of(group[0])
+            propagate_rename(records, group[0], name)
+            current_name = label_of(group[0])
+            if category == "floor":
+                reconcile_match_rename(prior_name, current_name, records)
+            else:
+                reconcile_plan_rename(prior_name, current_name, records, group[0])
+        quantity = row.get("Corrected Qty")
+        try:
+            value = int(quantity)
+            if float(quantity) != value or value < 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        detected = old["Detected Qty"]
+        if value == detected:
+            corrections.pop(identifier, None)
+        else:
+            corrections[identifier] = value
+    return build_summary(records, corrections, category)
+
+
+def show_summary_total(rows: list[dict], name_column: str) -> None:
+    totals = summary_totals(rows)
+    total_row = pd.DataFrame([{
+        name_column: "Grand Total",
+        "Detected Qty": totals["detected"],
+        "Corrected Qty": totals["corrected"],
+    }])
+    styled = total_row.style.set_properties(**{"font-weight": "bold"}).set_table_styles([
+        {"selector": "th, td", "props": [("border", "1px solid #000"),
+                                           ("padding", "0.25rem")]},
+        {"selector": "tbody td", "props": [("font-weight", "bold")]},
+    ])
+    st.dataframe(styled, hide_index=True, use_container_width=True, height=78)
 
 
 def fresh_click(key: str, click) -> tuple[float, float] | None:
@@ -206,7 +358,9 @@ file_hash = hashlib.md5(pdf).hexdigest()
 if st.session_state.get("file_hash") != file_hash:
     st.session_state.update(file_hash=file_hash, tags=None, pages=None, cursor=0,
                             tagged_pdf=None, clicks={}, centre={}, pending=None,
-                            pick_pages=True, units=None, unit_pages=None, units_cursor=0)
+                            pick_pages=True, units=None, unit_pages=None, units_cursor=0,
+                            match=None, match_summary=None, match_warning=None,
+                            floor_qty_corrections={}, unit_qty_corrections={})
 
 with st.spinner("Reading the PDF…"):
     page_count, titles, sheets, page_sizes = scan(file_hash, pdf)
@@ -269,7 +423,8 @@ if st.session_state.get("pick_pages", True):
                 progress.progress(n / len(chosen), text=f"Page {pn} ({n} of {len(chosen)})")
         progress.empty()
         st.session_state.update(tags=found, pages=chosen, cursor=0,
-                                tagged_pdf=None, pick_pages=False, pending=None)
+                                tagged_pdf=None, pick_pages=False, pending=None,
+                                match=None, match_warning=None)
         st.rerun()
     st.stop()
 
@@ -285,8 +440,18 @@ st.success(f"**{len(tags)} units** found across {len({t['page'] for t in tags})}
 st.caption(" · ".join(f"page {pn}: {sum(1 for t in tags if t['page'] == pn)}"
                       for pn in sorted({t["page"] for t in tags})))
 
+st.subheader("2. Floor Tag Summary")
+floor_summary_rows = editable_summary(tags, "floor", "Floor Tag",
+                                      "floor_qty_corrections")
+floor_summary = summary_pairs(floor_summary_rows)
+floor_names = [row["Name"] for row in floor_summary_rows]
+if len({str(name).casefold() for name in floor_names}) != len(floor_names):
+    st.warning("Some displayed Floor Tag names have separate original-name groups. Their "
+               "quantities remain separate so edits cannot overwrite another group.")
+show_summary_total(floor_summary_rows, "Floor Tag")
+
 # ----------------------------------------------------------------- 2. walkthrough
-st.subheader("2. Check every tag")
+st.subheader("3. Check every tag")
 st.caption("Enter keeps the tag and moves on. The cross deletes a wrong one. Correct the name "
            "in the box first if it is wrong.")
 
@@ -343,9 +508,18 @@ def walkthrough(store: str = "tags", cursor_key: str = "cursor", word: str = "Ta
              WINDOW, WINDOW, zoom)
 
     if keep:
+        old_name = label_of(tag)
         clean = name.strip()
-        tag["unit"] = "" if clean in ("", "?") else clean
+        clean = "" if clean in ("", "?") else clean
+        propagate_rename(tags, tag, clean)
+        current_name = label_of(tag)
+        if store == "tags":
+            reconcile_match_rename(old_name, current_name, tags)
+        elif store == "units":
+            reconcile_plan_rename(old_name, current_name, tags, tag)
         st.session_state[cursor_key] = min(cursor + 1, len(tags) - 1)
+        if old_name != current_name:
+            st.rerun()
         st.rerun(scope="fragment")
     if drop:
         st.session_state[store] = [t for t in tags if t["_i"] != cursor]
@@ -362,7 +536,7 @@ def walkthrough(store: str = "tags", cursor_key: str = "cursor", word: str = "Ta
 walkthrough()
 
 # ----------------------------------------------------------------- 3. add a missed tag
-st.subheader("3. Add anything the program missed")
+st.subheader("4. Add anything the program missed")
 
 if image_click is None:
     st.error("Click-to-place needs one package that is not installed yet. "
@@ -468,7 +642,7 @@ else:
     viewer()
 
 # ----------------------------------------------------------------- 4. unit labels
-st.subheader("4. Unit labels on the unit-plan sheets")
+st.subheader("5. Unit labels on the unit-plan sheets")
 st.caption("The name under each enlarged unit plan — “UNIT MI0.1”, “UNIT MI0.2” — found by the "
            "scale line printed beneath it. These get the same markup and their own Units tab.")
 
@@ -484,54 +658,77 @@ if label_pages and st.button(f"Read unit labels from {len(label_pages)} page(s)"
     with fitz.open(stream=pdf, filetype="pdf") as doc:
         for pn in label_pages:
             found += detect_unit_labels(doc[pn - 1], pn)
-    st.session_state.update(units=found, unit_pages=label_pages, units_cursor=0, tagged_pdf=None)
+    st.session_state.update(units=found, unit_pages=label_pages, units_cursor=0,
+                            tagged_pdf=None, match=None, match_warning=None)
     st.rerun()
 
 units = reindex("units")
 if units:
     st.success(f"**{len(units)} unit labels** across {len({u['page'] for u in units})} sheet(s).")
+
+st.subheader("6. Unit Plan Summary")
+units = reindex("units")
+unit_summary_rows = editable_summary(units, "unit", "Unit Plan",
+                                     "unit_qty_corrections")
+unit_summary = summary_pairs(unit_summary_rows)
+unit_names = [row["Name"] for row in unit_summary_rows]
+if len({str(name).casefold() for name in unit_names}) != len(unit_names):
+    st.warning("Some displayed Unit Plan names have separate original-name groups. Their "
+               "quantities remain separate so edits cannot overwrite another group.")
+show_summary_total(unit_summary_rows, "Unit Plan")
+
+if units:
     st.caption("Same walkthrough as the floor-plan tags: Enter keeps the label and moves on, "
                "the cross deletes a wrong one.")
     walkthrough(store="units", cursor_key="units_cursor", word="Unit label")
     with st.expander(f"All {len(units)} unit labels"):
-        st.dataframe(pd.DataFrame(sorted((label_of(u), u["page"]) for u in units),
+        st.dataframe(pd.DataFrame(sorted(((label_of(u), u["page"]) for u in units),
+                                         key=lambda row: natural_key(row[0])),
                                   columns=["Unit", "Page"]),
                      hide_index=True, use_container_width=True, height=240)
 elif st.session_state.get("units") is not None:
     st.warning("No unit labels were found on those sheets.")
 
-# ----------------------------------------------------------------- 5. match
-st.subheader("5. Put each floor tag under its unit plan")
+# ----------------------------------------------------------------- 7. match
+st.subheader("7. Put each floor tag under its unit plan")
 
 tags = st.session_state.tags
 units = st.session_state.get("units") or []
-summary = summarise(tags)
+summary = floor_summary
 merge_table: list[dict] | None = None
 
 if not units:
     st.info("Read the unit labels in step 4 to group the counted floor tags under them.")
 else:
-    st.caption("The unit plan is the parent; one plan can carry several floor tags. A floor tag "
-               "starts under a plan only when the two names are exactly the same — nothing is "
-               "guessed. Drag the rest from the panel onto the plan they belong to; drag one "
-               "back to take it out. A tag you place by hand shows red.")
+    st.caption("Exact name matches are assigned automatically. Use Edit in a merged Unit Plan "
+               "cell to assign or change individual floor tags; manually assigned tags show red.")
+    if st.session_state.get("match_warning"):
+        st.warning(st.session_state.match_warning)
     unit_cards, pool = parents(summary, [label_of(u) for u in units])
-    answer = matcher(units=unit_cards, pool=pool, key="matcher", default=None)
-    if answer:
-        st.session_state.match = answer
-
     state = st.session_state.get("match") or {
         "assigned": {u["unit"]: [k["tag"] for k in u["kids"]] for u in unit_cards},
         "manual": [], "unassigned": [p["tag"] for p in pool]}
     merge_table = merged_rows(summary, state.get("assigned", {}), state.get("manual", []))
+
+    total = matching_totals(merge_table)
+    answer = matcher(rows=merge_table,
+                     plans=sorted({u["unit"] for u in unit_cards}, key=str.upper),
+                     unassigned_label=UNASSIGNED, grand_total=total,
+                     key="matcher", default=None)
+    if answer is not None:
+        st.session_state.match = answer
+        state = answer
+        merge_table = merged_rows(summary, state.get("assigned", {}), state.get("manual", []))
+        total = matching_totals(merge_table)
+
     unplaced = sum(dict(summary).get(t, 0) for t in state.get("unassigned", []))
     st.caption(f"**{sum(q for _, q in summary) - unplaced} of {sum(q for _, q in summary)}** "
                f"units placed under a plan · "
                f"**{sum(1 for r in merge_table if r['manual'])}** floor tags placed by hand"
                + (f" · **{unplaced} units still unplaced**" if unplaced else ""))
 
-# ----------------------------------------------------------------- 6. export
-st.subheader("6. Export")
+# ----------------------------------------------------------------- 8. export
+st.subheader("8. Export")
 left, right = st.columns([2, 1])
 with left:
     st.dataframe(pd.DataFrame(summary, columns=["Label", "Qty"]),
@@ -542,7 +739,9 @@ with right:
     stem = Path(uploaded.name).stem
     sheet_numbers = {pn: (info.get("sheet") or "") for pn, info in sheets.items()}
     st.download_button("Download Excel",
-                       build_xlsx(tags, units, merge_table, sheet_numbers), type="primary",
+                       build_xlsx(tags, units, merge_table, sheet_numbers,
+                                  floor_summary=floor_summary,
+                                  unit_summary=unit_summary), type="primary",
                        file_name=f"{stem}_UNIT_MATRIX.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if st.button("Build tagged PDF"):
