@@ -1,27 +1,47 @@
-# Unit Matrix — Review build
+# Unit Matrix
 
-A separate, cut-down build of the Unit Matrix tool. The main app in `../code` is untouched.
+Streamlit app that counts dwelling units on HVAC/architectural floor plans and exports:
 
-What it does, and nothing more:
+- **Excel** in the unit-matrix format: `UNIT_MATRIX` (UNIT | Total + Grand Total), `TO` (pivot, "Sum of QTY"), `DATA` (one row per unit: UNIT | QTY | Count).
+- **Tagged PDF** with one Bluebeam count markup per unit (Polygon, subject `FLOOR UNIT`, contents `<unit>\r1`), so Bluebeam's markup summary gives the same totals.
 
-1. Upload the drawing set.
-2. Tick the floor-plan pages (thumbnail grid).
-3. Count the unit tags on them.
-4. **Walk through every tag.** Enter keeps it and moves to the next; the cross deletes a
-   wrong one; the name can be corrected in place.
-5. **Add anything missed** by clicking straight onto the page.
-6. Export the Excel and a tagged PDF whose markup *Subject* is the tag name, so Bluebeam's
-   Markups List identifies each count.
+## How units are found
 
-There is no benchmark table, no unit-plan mapping and no name resolution here by design.
-A tag with no printed type code falls back to its unit number (MA-501), matching the
-manager's checked takeoff; only a tag with neither shows as `?`.
+**Auto** reads unit labels from the plans' text layer. A line that is exactly `UNIT TYPE 2C`, `UNIT A1.0` or `Unit 2-0` is one unit. For `UNIT TYPE` labels, the bedroom line in the same room tag (`3BD`) is added: `2C-3BED`.
 
-## Run
+```
+3BD             <- bedroom count
+1035 SF
+2101            <- unit number (shown for review)
+UNIT TYPE 2C    <- one unit, named 2C-3BED
+MAAB GROUP 1
+```
 
-    cd "C:\Users\Purplle\Downloads\Unit Matrix Jobs\code-annotate"
-    ..\code\.venv\Scripts\Activate.ps1
-    streamlit run app.py
+**Match my list of unit names** is for jobs whose plans don't use `UNIT …` labels: type the names (e.g. `A1`, `A2 END`) and every line that reads exactly that name is tagged.
 
-`streamlit-image-coordinates` is needed for click-to-add. Without it the app still runs and
-offers a typed X/Y instead.
+Pages with unit labels are pre-selected. Remove unit-plan, enlarged-plan, RCP and schedule sheets so each unit is counted once. Image-only pages fall back to Tesseract OCR.
+
+## Run locally
+
+Needs 64-bit Python 3.10+ (Streamlit has no 32-bit Windows build) and, for scanned pages, Tesseract on PATH.
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Deploy (Streamlit Community Cloud)
+
+1. Push this folder to a GitHub repo.
+2. https://share.streamlit.io → **Create app** → pick the repo, branch `main`, main file `app.py`.
+3. `packages.txt` installs Tesseract; `.streamlit/config.toml` raises the upload limit to 300 MB.
+
+## Layout
+
+```
+app.py            Streamlit UI (upload -> pages -> detect -> review -> export)
+core/detect.py    unit-label detection, page suggestions, OCR fallback
+core/export.py    Excel (UNIT_MATRIX / TO / DATA) and Bluebeam markup PDF
+```
